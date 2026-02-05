@@ -1,8 +1,6 @@
 import Stripe from "stripe";
 
-export const config = {
-  api: { bodyParser: false },
-};
+export const config = { api: { bodyParser: false } };
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
@@ -26,20 +24,24 @@ export default async function handler(req, res) {
     const rawBody = await buffer(req);
     event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error("Webhook signature verification failed:", err.message);
+    console.error("❌ Webhook signature verification failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
-    // For now, just log that we received it successfully
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-      console.log("✅ checkout.session.completed for session:", session.id, "metadata:", session.metadata);
+      console.log("✅ checkout.session.completed", {
+        sessionId: session.id,
+        customer: session.customer,
+        payment_intent: session.payment_intent,
+        metadata: session.metadata,
+      });
     }
 
     return res.status(200).json({ received: true });
   } catch (err) {
-    console.error(err);
-    return res.status(500).send(err.message);
+    console.error("❌ Webhook handler error:", err);
+    return res.status(500).send("Server error");
   }
 }
