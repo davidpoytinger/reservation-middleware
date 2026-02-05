@@ -7,10 +7,14 @@ export default async function handler(req, res) {
     body: JSON.stringify({
       reservationId: "TEST-RES-123",
       bookingFeeAmount: 10,
-      customerEmail: "test@example.com"
+      customerEmail: "test@example.com",
     }),
   });
 
-  const data = await response.json();
-  res.status(200).json(data);
+  const bodyText = await response.text();
+  res.status(200).send(
+    `Downstream status: ${response.status}\n` +
+      `Downstream content-type: ${response.headers.get("content-type")}\n\n` +
+      bodyText
+  );
 }
