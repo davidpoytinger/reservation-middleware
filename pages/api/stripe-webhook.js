@@ -1,27 +1,22 @@
 // pages/api/stripe-webhook.js
 //
-// Stripe webhook that updates Caspio by IDKEY (metadata.reservation_id).
-// Uses path-based updateReservationByIdKey to avoid PUT-with-where routing issues.
+// Stripe webhook -> updates Caspio using PUT with q.where (NOT /records/{id})
 //
-// Required env vars:
+// Requires env vars:
 //   STRIPE_SECRET_KEY
 //   STRIPE_WEBHOOK_SECRET
-//   CASPIO_INTEGRATION_URL / CASPIO_TOKEN_URL (recommended)
+//   CASPIO_INTEGRATION_URL=https://c0gfs257.caspio.com
+//   CASPIO_TOKEN_URL=https://c0gfs257.caspio.com/oauth/token
 //   CASPIO_TABLE=BAR2_Reservations_SIGMA
 //   CASPIO_KEY_FIELD=IDKEY
-//
-// IMPORTANT:
-// - Field names in payload MUST exactly match your Caspio column names.
-// - If you haven't created some of these columns yet, remove them or rename accordingly.
+//   CASPIO_CLIENT_ID / CASPIO_CLIENT_SECRET
 
 import Stripe from "stripe";
-import { updateReservationByIdKey } from "../../lib/caspio";
+import { updateReservationByWhere, buildWhereForIdKey } from "../../lib/caspio";
 
 export const config = { api: { bodyParser: false } };
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: "2024-06-20",
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 async function buffer(readable) {
   const chunks = [];
@@ -52,24 +47,21 @@ export default async function handler(req, res) {
 
     const session = event.data.object;
 
-    // This should be your Caspio IDKEY (you passed it as idkey into create-checkout-session)
+    // We store Caspio IDKEY here when creating checkout session
     const idkey = session?.metadata?.reservation_id;
     if (!idkey) {
       console.error("❌ Missing metadata.reservation_id on Stripe session");
       return res.status(200).json({ received: true, skipped: "missing_reservation_id" });
     }
 
-    // Expand session => get customer + payment_intent
     const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
       expand: ["customer", "payment_intent"],
     });
 
-    // Pull payment details
     let paymentIntent = fullSession.payment_intent;
     if (typeof paymentIntent === "string") {
       paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent, { expand: ["payment_method"] });
     } else if (paymentIntent && typeof paymentIntent !== "string") {
-      // ensure payment_method expanded if possible
       if (typeof paymentIntent.payment_method === "string") {
         paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, { expand: ["payment_method"] });
       }
@@ -85,23 +77,24 @@ export default async function handler(req, res) {
 
     const cardBrand = card?.brand || null;
     const cardLast4 = card?.last4 || null;
-    const cardExp =
-      card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null;
+    const cardExp = card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null;
 
     const paidAtIso = new Date(
       (fullSession.created || Math.floor(Date.now() / 1000)) * 1000
     ).toISOString();
 
-    // ---- Caspio payload (rename fields to match YOUR schema) ----
+    const where = buildWhereForIdKey(idkey);
+
+    // IMPORTANT: These field names MUST match your Caspio columns exactly.
+    // If Caspio throws "Unknown column", rename/remove that key.
     const payload = {
       BookingFeePaid: 1,
       BookingFeePaidAt: paidAtIso,
-
       StripeCheckoutSessionId: fullSession.id,
       StripePaymentIntentId: paymentIntentId,
       StripeCustomerId: customerId,
 
-      // Optional “native-ish” fields (remove/rename if not present in Caspio)
+      // Optional fields (remove/rename if they don't exist in Caspio)
       Payment_processor: "Stripe",
       Mode: fullSession.livemode ? "live" : "test",
       Payment_service: "Checkout",
@@ -112,12 +105,12 @@ export default async function handler(req, res) {
       Transaction_ID: paymentIntentId,
       Transaction_date: paidAtIso,
     };
-    // ------------------------------------------------------------
 
-    const result = await updateReservationByIdKey(idkey, payload);
+    const result = await updateReservationByWhere(where, payload);
 
     console.log("✅ Caspio updated reservation (booking fee paid)", {
       idkey,
+      where,
       sessionId: fullSession.id,
       paymentIntentId,
       customerId,
@@ -127,8 +120,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error("❌ Webhook handler error:", err);
-    // If you prefer Stripe to always show green deliveries even if Caspio fails,
-    // you can return 200 here instead of 500. For now, keep it strict:
     return res.status(500).json({ error: err.message || "Server error" });
   }
 }
