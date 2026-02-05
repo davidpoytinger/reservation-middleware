@@ -53,10 +53,10 @@ export default async function handler(req, res) {
       },
       metadata: { reservation_id: String(reservationId), purpose: "booking_fee" },
 
-      success_url: `${process.env.SITE_BASE_URL}/reservation-confirmed?resId=${encodeURIComponent(
+      success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?IDKEY=${encodeURIComponent(
         reservationId
       )}`,
-      cancel_url: `${process.env.SITE_BASE_URL}/reservation-payment-cancelled?resId=${encodeURIComponent(
+      cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?IDKEY=${encodeURIComponent(
         reservationId
       )}`,
     });
