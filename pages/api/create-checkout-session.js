@@ -6,13 +6,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 export default async function handler(req, res) {
-  if (req.method === "GET") {
-  return res.status(200).json({ ok: true, route: "create-checkout-session" });
-}
-if (!process.env.STRIPE_SECRET_KEY) {
-  return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY env var" });
-}
-  try {
+
     if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
     const { reservationId, bookingFeeAmount, customerEmail } = req.body || {};
