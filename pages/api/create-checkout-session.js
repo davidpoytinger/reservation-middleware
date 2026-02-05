@@ -44,8 +44,8 @@ if (!process.env.STRIPE_SECRET_KEY) {
       },
       metadata: { reservation_id: String(reservationId), purpose: "booking_fee" },
 
-      success_url: `${process.env.SITE_BASE_URL}/reservation-confirmed?resId=${encodeURIComponent(reservationId)}`,
-      cancel_url: `${process.env.SITE_BASE_URL}/reservation-payment-cancelled?resId=${encodeURIComponent(reservationId)}`,
+      success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?res_Id=${encodeURIComponent(reservationId)}`,
+      cancel_url: `${process.env.SITE_BASE_URL}/rbarresv5confirmedpaymentcancelled?res_Id=${encodeURIComponent(reservationId)}`,
     });
 
     return res.status(200).json({ checkoutUrl: session.url, sessionId: session.id });
