@@ -1,5 +1,6 @@
 import Stripe from "stripe";
-import { getReservationByIdKey, updateReservationByWhere } from "../../lib/caspio";
+import { getReservationByIdKey, updateReservationByIdKey } from "../../lib/caspio";
+
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
@@ -61,13 +62,11 @@ export default async function handler(req, res) {
     });
 
     // Optional: store the Checkout Session ID immediately
-    const keyField = process.env.CASPIO_KEY_FIELD || "IDKEY";
-    const where = `${keyField}='${escapeCaspioValue(idkey)}'`;
+await updateReservationByIdKey(idkey, {
+  PaymentStatus: "PendingBookingFee",
+  StripeCheckoutSessionId: session.id,
+});
 
-    await updateReservationByWhere(where, {
-      PaymentStatus: "PendingBookingFee",
-      StripeCheckoutSessionId: session.id,
-    });
 
     return res.status(200).json({ checkoutUrl: session.url, sessionId: session.id });
   } catch (err) {
