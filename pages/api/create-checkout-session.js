@@ -78,8 +78,8 @@ export default async function handler(req, res) {
       metadata: { reservation_id: String(idkey), purpose: "booking_fee" },
 
       // You can change these to whatever Weebly pages you want
-      success_url: `${process.env.SITE_BASE_URL}/reservation-confirmed?idkey=${encodeURIComponent(idkey)}`,
-      cancel_url: `${process.env.SITE_BASE_URL}/reservation-payment-cancelled?idkey=${encodeURIComponent(idkey)}`,
+      success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?idkey=${encodeURIComponent(idkey)}`,
+      cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
     });
 
     // 3) Optional: write "pending" status + session id back to Caspio for traceability
