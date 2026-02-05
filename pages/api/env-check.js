@@ -12,6 +12,8 @@ export default function handler(req, res) {
       clientSecretSet: !!process.env.CASPIO_CLIENT_SECRET,
       tableSet: !!process.env.CASPIO_TABLE,
       keyField: process.env.CASPIO_KEY_FIELD || null,
+      integrationUrlSet: !!process.env.CASPIO_INTEGRATION_URL,
+      tokenUrlSet: !!process.env.CASPIO_TOKEN_URL,
     },
   });
 }
