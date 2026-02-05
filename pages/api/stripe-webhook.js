@@ -89,6 +89,7 @@ export default async function handler(req, res) {
       // Optional extras (remove/rename if your Caspio columns differ)
       Payment_processor: "Stripe",
       Mode: fullSession.livemode ? "live" : "test",
+      Status: "Booked",
       Payment_service: "Checkout",
       Token_ID: customerId,
       Card_brand: card?.brand || null,
