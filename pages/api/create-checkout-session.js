@@ -21,10 +21,9 @@ export default async function handler(req, res) {
     const { idkey } = req.body || {};
     if (!idkey) return res.status(400).json({ error: "Missing idkey" });
 
-    // ---- CONFIG: change these to your real Caspio column names ----
-    const CASPIO_EMAIL_FIELD = "Email";           // <-- change if different
-    const CASPIO_BOOKING_FEE_FIELD = "BookingFeeAmount"; // <-- change if different
-    // --------------------------------------------------------------
+    // Your column names (as you confirmed)
+    const CASPIO_EMAIL_FIELD = "Email";
+    const CASPIO_BOOKING_FEE_FIELD = "BookingFeeAmount";
 
     const reservation = await getReservationByIdKey(idkey);
 
@@ -50,7 +49,7 @@ export default async function handler(req, res) {
         },
       ],
 
-      // Save card for later (off-session policy enforcement)
+      // Save card for later off-session charge
       payment_intent_data: {
         setup_future_usage: "off_session",
         metadata: { reservation_id: String(idkey), purpose: "booking_fee" },
@@ -61,11 +60,10 @@ export default async function handler(req, res) {
       cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
     });
 
-    // Optional: record the session id immediately in Caspio so you can trace attempts
+    // Optional: store the Checkout Session ID immediately
     const keyField = process.env.CASPIO_KEY_FIELD || "IDKEY";
     const where = `${keyField}='${escapeCaspioValue(idkey)}'`;
 
-    // Rename these fields to match your Caspio schema, or remove if not created yet
     await updateReservationByWhere(where, {
       PaymentStatus: "PendingBookingFee",
       StripeCheckoutSessionId: session.id,
