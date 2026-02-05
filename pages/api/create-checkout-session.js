@@ -1,3 +1,7 @@
+if (!process.env.STRIPE_SECRET_KEY) {
+  return res.status(500).json({ error: "Missing STRIPE_SECRET_KEY env var" });
+}
+
 import Stripe from "stripe";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
