@@ -81,7 +81,6 @@ export default async function handler(req, res) {
     const where = buildWhereForIdKey(idkey);
 
     const payload = {
-      BookingFeePaid: 1,
       BookingFeePaidAt: paidAtIso,
       StripeCheckoutSessionId: fullSession.id,
       StripePaymentIntentId: paymentIntentId,
