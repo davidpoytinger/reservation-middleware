@@ -5,6 +5,10 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 });
 
 export default async function handler(req, res) {
+  if (req.method === "GET") {
+  return res.status(200).json({ ok: true, route: "create-checkout-session" });
+}
+
   try {
     if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
