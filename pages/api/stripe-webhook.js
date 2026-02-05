@@ -1,5 +1,21 @@
+// pages/api/stripe-webhook.js
+//
+// Stripe webhook that updates Caspio by IDKEY (metadata.reservation_id).
+// Uses path-based updateReservationByIdKey to avoid PUT-with-where routing issues.
+//
+// Required env vars:
+//   STRIPE_SECRET_KEY
+//   STRIPE_WEBHOOK_SECRET
+//   CASPIO_INTEGRATION_URL / CASPIO_TOKEN_URL (recommended)
+//   CASPIO_TABLE=BAR2_Reservations_SIGMA
+//   CASPIO_KEY_FIELD=IDKEY
+//
+// IMPORTANT:
+// - Field names in payload MUST exactly match your Caspio column names.
+// - If you haven't created some of these columns yet, remove them or rename accordingly.
+
 import Stripe from "stripe";
-import { updateReservationByWhere } from "../../lib/caspio";
+import { updateReservationByIdKey } from "../../lib/caspio";
 
 export const config = { api: { bodyParser: false } };
 
@@ -13,12 +29,6 @@ async function buffer(readable) {
     chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
   }
   return Buffer.concat(chunks);
-}
-
-function escapeCaspioValue(v) {
-  // Caspio q.where uses single quotes for text.
-  // Escape embedded single quotes by doubling them.
-  return String(v).replaceAll("'", "''");
 }
 
 export default async function handler(req, res) {
@@ -40,79 +50,74 @@ export default async function handler(req, res) {
       return res.status(200).json({ received: true, ignored: event.type });
     }
 
-    // 1) Get the Session
     const session = event.data.object;
 
-    // 2) Pull the IDKEY out of Stripe metadata
-    // IMPORTANT: This must be the Caspio IDKEY value you passed into create-checkout-session as "reservationId"
-    const reservationId = session?.metadata?.reservation_id;
-    if (!reservationId) {
+    // This should be your Caspio IDKEY (you passed it as idkey into create-checkout-session)
+    const idkey = session?.metadata?.reservation_id;
+    if (!idkey) {
       console.error("❌ Missing metadata.reservation_id on Stripe session");
       return res.status(200).json({ received: true, skipped: "missing_reservation_id" });
     }
 
-    // 3) Retrieve expanded session so we can get payment_intent + card details
+    // Expand session => get customer + payment_intent
     const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
-      expand: ["payment_intent", "customer"],
+      expand: ["customer", "payment_intent"],
     });
 
-    const paymentIntent =
-      typeof fullSession.payment_intent === "string"
-        ? await stripe.paymentIntents.retrieve(fullSession.payment_intent, {
-            expand: ["payment_method"],
-          })
-        : fullSession.payment_intent;
+    // Pull payment details
+    let paymentIntent = fullSession.payment_intent;
+    if (typeof paymentIntent === "string") {
+      paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent, { expand: ["payment_method"] });
+    } else if (paymentIntent && typeof paymentIntent !== "string") {
+      // ensure payment_method expanded if possible
+      if (typeof paymentIntent.payment_method === "string") {
+        paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, { expand: ["payment_method"] });
+      }
+    }
 
     const customerId =
-      typeof fullSession.customer === "string" ? fullSession.customer : fullSession.customer?.id;
+      typeof fullSession.customer === "string" ? fullSession.customer : fullSession.customer?.id || null;
 
     const paymentIntentId = paymentIntent?.id || null;
 
-    // Card details (optional but helpful)
     const pm = paymentIntent?.payment_method;
     const card = pm && typeof pm !== "string" ? pm.card : null;
 
     const cardBrand = card?.brand || null;
     const cardLast4 = card?.last4 || null;
-    const cardExp = card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null;
+    const cardExp =
+      card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null;
 
-    // Stripe event/session timestamps are seconds
-    const paidAtIso = new Date((fullSession.created || Math.floor(Date.now() / 1000)) * 1000).toISOString();
+    const paidAtIso = new Date(
+      (fullSession.created || Math.floor(Date.now() / 1000)) * 1000
+    ).toISOString();
 
-    // 4) Build Caspio WHERE clause using IDKEY
-    const keyField = process.env.CASPIO_KEY_FIELD || "IDKEY";
-    const where = `${keyField}='${escapeCaspioValue(reservationId)}'`;
-
-    // 5) Build payload to update Caspio
-    // IMPORTANT: Field names MUST match your Caspio column names exactly.
-    // Keep the "Stripe*" fields if you created them. The others are optional.
+    // ---- Caspio payload (rename fields to match YOUR schema) ----
     const payload = {
-      // --- Recommended internal tracking fields (rename if your columns differ) ---
-      BookingFeePaid: 1,                 // If your field is Yes/No, you can use true instead
+      BookingFeePaid: 1,
       BookingFeePaidAt: paidAtIso,
+
       StripeCheckoutSessionId: fullSession.id,
       StripePaymentIntentId: paymentIntentId,
       StripeCustomerId: customerId,
 
-      // --- Optional: mirror the "Native Caspio Stripe Payment" fields you listed ---
-      // Rename these keys to match your exact Caspio column names.
+      // Optional “native-ish” fields (remove/rename if not present in Caspio)
       Payment_processor: "Stripe",
       Mode: fullSession.livemode ? "live" : "test",
       Payment_service: "Checkout",
-      Token_ID: customerId, // Often best to store Stripe Customer ID as your "token" for later charges
+      Token_ID: customerId,
       Card_brand: cardBrand,
       Card_number_masked: cardLast4 ? `**** **** **** ${cardLast4}` : null,
       Card_expiration: cardExp,
       Transaction_ID: paymentIntentId,
       Transaction_date: paidAtIso,
     };
+    // ------------------------------------------------------------
 
-    // 6) Write to Caspio
-    const result = await updateReservationByWhere(where, payload);
+    const result = await updateReservationByIdKey(idkey, payload);
 
     console.log("✅ Caspio updated reservation (booking fee paid)", {
-      reservationId,
-      where,
+      idkey,
       sessionId: fullSession.id,
       paymentIntentId,
       customerId,
@@ -122,6 +127,8 @@ export default async function handler(req, res) {
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error("❌ Webhook handler error:", err);
+    // If you prefer Stripe to always show green deliveries even if Caspio fails,
+    // you can return 200 here instead of 500. For now, keep it strict:
     return res.status(500).json({ error: err.message || "Server error" });
   }
 }
