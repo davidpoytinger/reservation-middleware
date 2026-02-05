@@ -27,6 +27,11 @@ async function buffer(readable) {
 }
 
 export default async function handler(req, res) {
+  console.log("WEBHOOK HIT", {
+  host: req.headers.host,
+  url: req.url,
+});
+  
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
   const sig = req.headers["stripe-signature"];
