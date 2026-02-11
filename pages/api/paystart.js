@@ -1,22 +1,137 @@
 // pages/api/paystart.js
-import { getReservationByIdKey } from "../../lib/caspio"; // optional sanity check; can remove
+import Stripe from "stripe";
+import {
+  getReservationByIdKey,
+  updateReservationByWhere,
+  buildWhereForIdKey,
+} from "../../lib/caspio";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
+
+function formatUsd(amountNumber) {
+  const n = Number(amountNumber);
+  if (!Number.isFinite(n)) return "";
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+}
+
+// Keep idempotency keys ASCII + <=255 chars.
+// Deterministic short hash (not crypto, just stable).
+function shortHash(input) {
+  const s = String(input || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
 
 export default async function handler(req, res) {
   if (req.method !== "GET") return res.status(405).send("Method not allowed");
 
   try {
+    if (!process.env.STRIPE_SECRET_KEY) return res.status(500).send("Missing STRIPE_SECRET_KEY");
     if (!process.env.SITE_BASE_URL) return res.status(500).send("Missing SITE_BASE_URL");
+    if (!process.env.CASPIO_TABLE) return res.status(500).send("Missing CASPIO_TABLE");
 
     const idkey = req.query.idkey || req.query.IDKEY || req.query.IdKey;
     if (!idkey) return res.status(400).send("Missing idkey");
 
-    // Optional: quick sanity check that reservation exists (non-required)
-    await getReservationByIdKey(idkey);
+    // 1) Pull reservation data from Caspio
+    const reservation = await getReservationByIdKey(idkey);
 
+    const customerEmail = reservation.Email;
+    const bookingFeeAmount = Number(reservation.BookingFeeAmount);
+
+    const peopleText = (reservation.People_Text ?? "").toString().trim();
+    const sessionsTitle = (reservation.Sessions_Title ?? "").toString().trim();
+    const chargeTypeRaw = (reservation.Charge_Type ?? "").toString().trim();
+
+    if (!customerEmail) return res.status(400).send("Missing Email on reservation");
+    if (!bookingFeeAmount || bookingFeeAmount <= 0) {
+      return res.status(400).send("Missing/invalid BookingFeeAmount on reservation");
+    }
+
+    const unitAmount = Math.round(bookingFeeAmount * 100);
+    const amountDisplay = formatUsd(bookingFeeAmount);
+
+    // ✅ Left-side title
+    const displayChargeType = chargeTypeRaw || "Booking Fee";
+
+    // ✅ Your original desired block (best-effort inside Stripe Checkout)
+    const productDescription = [
+      "What You Are Booking",
+      sessionsTitle || "Your Reservation",
+      peopleText || "",
+      "",
+      "What You Owe Now",
+      `${displayChargeType}: ${amountDisplay}`,
+    ].filter(Boolean).join("\n");
+
+    const sharedMetadata = {
+      reservation_id: String(idkey),
+      purpose: "booking_fee",
+      Charge_Type: displayChargeType,
+      Sessions_Title: sessionsTitle || "",
+      People_Text: peopleText || "",
+    };
+
+    // ✅ Smart idempotency: changes if left-side content changes
+    const idemKey = [
+      "RES",
+      String(idkey),
+      unitAmount,
+      shortHash(displayChargeType),
+      shortHash(sessionsTitle),
+      shortHash(peopleText),
+    ].join("_");
+
+    // 2) Create Stripe Checkout Session (idempotent)
+    const session = await stripe.checkout.sessions.create(
+      {
+        mode: "payment",
+        customer_email: customerEmail,
+
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: displayChargeType,      // ✅ replaces "Booking Fee"
+                description: productDescription, // ✅ your formatting attempt
+              },
+              unit_amount: unitAmount,
+            },
+          },
+        ],
+
+        payment_intent_data: {
+          setup_future_usage: "off_session",
+          metadata: sharedMetadata,
+        },
+        metadata: sharedMetadata,
+
+        success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?idkey=${encodeURIComponent(idkey)}`,
+        cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
+      },
+      {
+        idempotencyKey: idemKey,
+      }
+    );
+
+    // 3) Optional Caspio "pending" writeback
+    try {
+      const where = buildWhereForIdKey(idkey);
+      await updateReservationByWhere(where, {
+        PaymentStatus: "PendingBookingFee",
+        StripeCheckoutSessionId: session.id,
+      });
+    } catch (e) {
+      console.warn("Caspio pending writeback skipped/failed:", e?.message || e);
+    }
+
+    // 4) Redirect to Stripe Checkout
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
 
-    // Calls create-checkout-session and redirects to returned URL
     return res.status(200).send(`<!doctype html>
 <html lang="en">
 <head>
@@ -56,26 +171,9 @@ export default async function handler(req, res) {
   </div>
 
   <script>
-    (async function () {
-      try {
-        const resp = await fetch("/api/create-checkout-session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ idkey: ${JSON.stringify(String(idkey))} })
-        });
-
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data?.error || "Could not start checkout");
-
-        window.location.replace(data.url);
-      } catch (e) {
-        document.body.innerHTML =
-          "<pre style='white-space:pre-wrap;font-family:system-ui;padding:16px;'>"
-          + "We couldn’t start your payment.\\n"
-          + (e && e.message ? e.message : String(e))
-          + "</pre>";
-      }
-    })();
+    setTimeout(function () {
+      window.location.replace(${JSON.stringify(session.url)});
+    }, 250);
   </script>
 </body>
 </html>`);
