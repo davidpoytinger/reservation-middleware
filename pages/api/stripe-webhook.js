@@ -144,10 +144,13 @@ export default async function handler(req, res) {
     };
 
     // ✅ Only set Email_Design if we actually got a non-empty value from the view
-    if (emailDesignFromView && emailDesignFromView !== "") {
-      payload.Email_Design = emailDesignFromView;
-    }
-
+if (emailDesignFromView && emailDesignFromView !== "") {
+  const maxLen = 64000;
+  payload.Email_Design =
+    String(emailDesignFromView).length > maxLen
+      ? String(emailDesignFromView).slice(0, maxLen)
+      : emailDesignFromView;
+}
     const result = await updateReservationByWhere(where, payload);
     console.log("✅ CASPIO_UPDATE_OK", { idkey, where, result });
 
