@@ -1,7 +1,6 @@
 import Stripe from "stripe";
 import {
   updateReservationByWhere,
-  buildWhereForIdKey,
   insertTransactionIfMissingByRawEventId,
   getReservationByIdKey,
   getResBillingEditViewRowByIdKey, // view helper: SIGMA_VW_Res_Billing_Edit by IDKEY
@@ -94,11 +93,16 @@ export default async function handler(req, res) {
     const currency = paymentIntent?.currency ? String(paymentIntent.currency).toLowerCase() : "usd";
     const chargeId = charge?.id || null;
 
-    const paidAtIso = new Date(
-      (fullSession.created || Math.floor(Date.now() / 1000)) * 1000
-    ).toISOString();
+    // ✅ Prefer actual payment time (charge.created), then PI.created, then session.created
+    const paidAtUnix =
+      charge?.created ||
+      paymentIntent?.created ||
+      fullSession.created ||
+      Math.floor(Date.now() / 1000);
 
-    const where = buildWhereForIdKey(idkey);
+    const paidAtIso = new Date(paidAtUnix * 1000).toISOString();
+
+    const where = `IDKEY='${String(idkey).replaceAll("'", "''")}'`;
 
     // -------------------------
     // Pull Email_Design from VIEW (so we only update once)
@@ -135,22 +139,25 @@ export default async function handler(req, res) {
       Status: "Booked",
       Payment_service: "Checkout",
       Token_ID: customerId,
+
       Card_brand: card?.brand || null,
       Card_number_masked: card?.last4 ? `**** **** **** ${card.last4}` : null,
       Card_expiration:
         card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
+
       Transaction_ID: paymentIntentId,
       Transaction_date: paidAtIso,
     };
 
     // ✅ Only set Email_Design if we actually got a non-empty value from the view
-if (emailDesignFromView && emailDesignFromView !== "") {
-  const maxLen = 64000;
-  payload.Email_Design =
-    String(emailDesignFromView).length > maxLen
-      ? String(emailDesignFromView).slice(0, maxLen)
-      : emailDesignFromView;
-}
+    if (emailDesignFromView && emailDesignFromView !== "") {
+      const maxLen = 64000;
+      payload.Email_Design =
+        String(emailDesignFromView).length > maxLen
+          ? String(emailDesignFromView).slice(0, maxLen)
+          : emailDesignFromView;
+    }
+
     const result = await updateReservationByWhere(where, payload);
     console.log("✅ CASPIO_UPDATE_OK", { idkey, where, result });
 
