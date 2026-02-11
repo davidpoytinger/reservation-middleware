@@ -16,6 +16,12 @@ function setCors(res, origin) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
+function formatUsd(amountNumber) {
+  const n = Number(amountNumber);
+  if (!Number.isFinite(n)) return "";
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+}
+
 export default async function handler(req, res) {
   // ✅ CORS for browser calls (Weebly -> Vercel is cross-origin)
   setCors(res, req.headers.origin);
@@ -49,10 +55,59 @@ export default async function handler(req, res) {
     const customerEmail = reservation.Email;
     const bookingFeeAmount = Number(reservation.BookingFeeAmount);
 
+    // ✅ NEW: Pull the fields you want shown/passed to Stripe
+    const peopleText = (reservation.People_Text ?? "").toString().trim();
+    const sessionTitle = (reservation.Session_Title ?? "").toString().trim();
+    const chargeType = (reservation.Charge_Type ?? "").toString().trim();
+
     if (!customerEmail) return res.status(400).json({ error: "Missing Email on reservation" });
     if (!bookingFeeAmount || bookingFeeAmount <= 0) {
       return res.status(400).json({ error: "Missing/invalid BookingFeeAmount on reservation" });
     }
+
+    // Stripe amounts
+    const unitAmount = Math.round(bookingFeeAmount * 100);
+    const amountDisplay = formatUsd(bookingFeeAmount);
+
+    // Display strings (safe fallbacks)
+    const displaySessionTitle = sessionTitle || "Your Reservation";
+    const displayPeopleText = peopleText || "";
+    const displayChargeType = chargeType || "Amount Due Now";
+
+    // --- This is the "layout" you asked for, approximated within Stripe Checkout limitations ---
+    // We'll use:
+    //  - Line item name: Charge_Type (so it appears right next to the amount)
+    //  - Line item description: booking info (Session_Title + People_Text)
+    //  - Submit message: the full block with headers
+    const lineItemName = displayChargeType;
+
+    const lineItemDescription = [
+      "What You Are Booking",
+      displaySessionTitle,
+      displayPeopleText
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const submitMessage = [
+      "What You Are Booking",
+      displaySessionTitle,
+      displayPeopleText,
+      "",
+      "What You Owe Now",
+      `${displayChargeType}: ${amountDisplay}`,
+    ]
+      .filter((v) => v !== undefined && v !== null)
+      .join("\n");
+
+    // Shared metadata for webhook/reporting
+    const sharedMetadata = {
+      reservation_id: String(idkey),
+      purpose: "booking_fee",
+      Charge_Type: displayChargeType,
+      Session_Title: displaySessionTitle,
+      People_Text: displayPeopleText,
+    };
 
     // 2) Create Stripe Checkout Session (with idempotency)
     const session = await stripe.checkout.sessions.create(
@@ -65,8 +120,11 @@ export default async function handler(req, res) {
             quantity: 1,
             price_data: {
               currency: "usd",
-              product_data: { name: "Booking Fee" },
-              unit_amount: Math.round(bookingFeeAmount * 100),
+              product_data: {
+                name: lineItemName,
+                description: lineItemDescription, // supports \n; Stripe may render as line breaks or spaced lines
+              },
+              unit_amount: unitAmount,
             },
           },
         ],
@@ -74,9 +132,16 @@ export default async function handler(req, res) {
         // Save card for later off-session policy enforcement
         payment_intent_data: {
           setup_future_usage: "off_session",
-          metadata: { reservation_id: String(idkey), purpose: "booking_fee" },
+          metadata: sharedMetadata,
         },
-        metadata: { reservation_id: String(idkey), purpose: "booking_fee" },
+
+        // Also attach to Checkout Session itself (easy to read in webhook)
+        metadata: sharedMetadata,
+
+        // Small message near the pay button — best place to show your 2-section layout
+        custom_text: {
+          submit: { message: submitMessage },
+        },
 
         // Weebly pages
         success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?idkey=${encodeURIComponent(idkey)}`,
@@ -98,8 +163,8 @@ export default async function handler(req, res) {
 
     // ✅ Return both keys so your front-end can use either
     return res.status(200).json({
-      url: session.url,              // preferred (matches PayStart code I gave you)
-      checkoutUrl: session.url,      // backward compatible
+      url: session.url,         // preferred
+      checkoutUrl: session.url, // backward compatible
       sessionId: session.id,
     });
   } catch (err) {
