@@ -37,9 +37,14 @@ export default async function handler(req, res) {
   }
 
   const session = event.data.object;
-  const idkey = session?.metadata?.reservation_id;
 
+  const idkey = session?.metadata?.reservation_id;
   if (!idkey) return res.status(200).json({ received: true });
+
+  // ✅ Pull metadata sent from create-checkout-session
+  const metaChargeType = session?.metadata?.Charge_Type || null;
+  const metaSessionsTitle = session?.metadata?.Sessions_Title || null;
+  const metaPeopleText = session?.metadata?.People_Text || null;
 
   try {
     const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
@@ -87,7 +92,7 @@ export default async function handler(req, res) {
     }
 
     // -----------------------------------------
-    // BUILD RESERVATION UPDATE PAYLOAD
+    // RESERVATION UPDATE
     // -----------------------------------------
     const payload = {
       BookingFeePaidAt: paidAtIso,
@@ -112,15 +117,18 @@ export default async function handler(req, res) {
       Transaction_date: paidAtIso,
     };
 
+    // ✅ Update reservation with Stripe metadata (if present)
+    if (metaChargeType) payload.Charge_Type = metaChargeType;
+    if (metaSessionsTitle) payload.Sessions_Title = metaSessionsTitle;
+    if (metaPeopleText) payload.People_Text = metaPeopleText;
+
     if (viewRow) {
-      // 64000-safe Email_Design
       if (viewRow.BAR2_Email_Design_Email_Content) {
         const maxLen = 64000;
         const val = String(viewRow.BAR2_Email_Design_Email_Content);
         payload.Email_Design = val.length > maxLen ? val.slice(0, maxLen) : val;
       }
 
-      // Simple text mappings
       payload.Logo_Graphic_Email_String =
         viewRow.GEN_Business_Units_Logo_Graphic_Email_String || null;
 
@@ -128,7 +136,7 @@ export default async function handler(req, res) {
         viewRow.GEN_Business_Units_DBA || null;
 
       payload.Sessions_Title =
-        viewRow.BAR2_Sessions_Title || null;
+        viewRow.BAR2_Sessions_Title || payload.Sessions_Title || null;
 
       payload.Event_Email_Preheader =
         viewRow.GEN_Business_Units_Event_Email_Preheader || null;
@@ -146,10 +154,13 @@ export default async function handler(req, res) {
     await updateReservationByWhere(where, payload);
 
     // -----------------------------------------
-    // TRANSACTION INSERT (unchanged logic)
+    // TRANSACTION INSERT
     // -----------------------------------------
-    const reservationRow = await getReservationByIdKey(idkey).catch(() => null);
-    const reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
+    let reservationChargeType = metaChargeType;
+    if (!reservationChargeType) {
+      const reservationRow = await getReservationByIdKey(idkey).catch(() => null);
+      reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
+    }
 
     const txnPayload = {
       IDKEY: String(idkey),
