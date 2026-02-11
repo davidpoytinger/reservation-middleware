@@ -1,4 +1,30 @@
 // pages/api/paystart.js
+//
+// Purpose:
+// - Browser lands here from Caspio after form submit:
+//     https://reservation-middleware2.vercel.app/api/paystart?idkey=@IDKEY
+// - Server looks up the reservation in Caspio, creates a Stripe Checkout Session (idempotent),
+//   optionally writes "pending" status back to Caspio, then shows a short branded
+//   "Redirecting to secure payment..." page and navigates to Stripe Checkout.
+//
+// Required env vars:
+//   STRIPE_SECRET_KEY
+//   SITE_BASE_URL
+//   CASPIO_TABLE
+//
+// Assumed Caspio fields:
+//   Email
+//   BookingFeeAmount
+//
+// Optional (used for display/metadata):
+//   Sessions_Title
+//   People_Text
+//   Charge_Type
+//
+// Optional Caspio fields (only if you have them):
+//   PaymentStatus
+//   StripeCheckoutSessionId
+
 import Stripe from "stripe";
 import {
   getReservationByIdKey,
@@ -24,6 +50,7 @@ function shortHash(input) {
 }
 
 export default async function handler(req, res) {
+  // We only want simple GET navigations here (Caspio/browser redirect)
   if (req.method !== "GET") return res.status(405).send("Method not allowed");
 
   try {
@@ -40,8 +67,9 @@ export default async function handler(req, res) {
     const customerEmail = reservation.Email;
     const bookingFeeAmount = Number(reservation.BookingFeeAmount);
 
-    const peopleText = (reservation.People_Text ?? "").toString().trim();
-    const sessionsTitle = (reservation.Sessions_Title ?? "").toString().trim();
+    // Optional display fields
+    const sessionsTitleRaw = (reservation.Sessions_Title ?? "").toString().trim();
+    const peopleTextRaw = (reservation.People_Text ?? "").toString().trim();
     const chargeTypeRaw = (reservation.Charge_Type ?? "").toString().trim();
 
     if (!customerEmail) return res.status(400).send("Missing Email on reservation");
@@ -52,35 +80,36 @@ export default async function handler(req, res) {
     const unitAmount = Math.round(bookingFeeAmount * 100);
     const amountDisplay = formatUsd(bookingFeeAmount);
 
-    // ✅ Left-side title
+    const displaySessionsTitle = sessionsTitleRaw || "";
+    const displayPeopleText = peopleTextRaw ? peopleTextRaw.replace(/\s+/g, " ").trim() : "";
     const displayChargeType = chargeTypeRaw || "Booking Fee";
 
-    // ✅ Your original desired block (best-effort inside Stripe Checkout)
-    const productDescription = [
-      "What You Are Booking",
-      sessionsTitle || "Your Reservation",
-      peopleText || "",
-      "",
-      "What You Owe Now",
-      `${displayChargeType}: ${amountDisplay}`,
-    ].filter(Boolean).join("\n");
+    // ✅ LEFT COLUMN TITLE (Stripe always shows this):
+    // Sessions_Title  |  People_Text   (fallback to Charge_Type if blank)
+    const combinedTitle = [displaySessionsTitle, displayPeopleText]
+      .filter(Boolean)
+      .join("  |  ")
+      .slice(0, 120);
 
+    const productName = combinedTitle || displayChargeType;
+
+    // Metadata for webhook/reporting
     const sharedMetadata = {
       reservation_id: String(idkey),
       purpose: "booking_fee",
       Charge_Type: displayChargeType,
-      Sessions_Title: sessionsTitle || "",
-      People_Text: peopleText || "",
+      Sessions_Title: displaySessionsTitle,
+      People_Text: displayPeopleText,
+      Amount_Display: amountDisplay,
     };
 
-    // ✅ Smart idempotency: changes if left-side content changes
+    // Smart idempotency: changes if amount/title/text changes
     const idemKey = [
       "RES",
       String(idkey),
       unitAmount,
+      shortHash(productName),
       shortHash(displayChargeType),
-      shortHash(sessionsTitle),
-      shortHash(peopleText),
     ].join("_");
 
     // 2) Create Stripe Checkout Session (idempotent)
@@ -95,14 +124,14 @@ export default async function handler(req, res) {
             price_data: {
               currency: "usd",
               product_data: {
-                name: displayChargeType,      // ✅ replaces "Booking Fee"
-                description: productDescription, // ✅ your formatting attempt
+                name: productName,
               },
               unit_amount: unitAmount,
             },
           },
         ],
 
+        // Save card for later off-session policy enforcement
         payment_intent_data: {
           setup_future_usage: "off_session",
           metadata: sharedMetadata,
@@ -128,7 +157,7 @@ export default async function handler(req, res) {
       console.warn("Caspio pending writeback skipped/failed:", e?.message || e);
     }
 
-    // 4) Redirect to Stripe Checkout
+    // 4) Polished handoff page (briefly) then redirect to Stripe Checkout
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
 
