@@ -120,10 +120,20 @@ export default async function handler(req, res) {
             quantity: 1,
             price_data: {
               currency: "usd",
-              product_data: {
-                name: lineItemName,
-                description: lineItemDescription,
-              },
+             product_data: {
+  // This becomes the BIG title on the left
+  name: displayChargeType,  // e.g. "Booking Fee", "Deposit", "Balance Due"
+
+  // This becomes the smaller text under it (Stripe may show it, depending on layout)
+  description: [
+    "What You Are Booking",
+    displaySessionsTitle,
+    displayPeopleText,
+    "",
+    "What You Owe Now",
+    `${displayChargeType}: ${amountDisplay}`,
+  ].filter(Boolean).join("\n"),
+},
               unit_amount: unitAmount,
             },
           },
@@ -149,7 +159,9 @@ export default async function handler(req, res) {
       },
       {
         // ✅ prevents duplicate sessions on retry/double-click
-        idempotencyKey: `RES_${idkey}_checkout_v2`,
+        - idempotencyKey: `RES_${idkey}_checkout_v2`,
++ idempotencyKey: `RES_${idkey}_checkout_v3`,
+
       }
     );
 
