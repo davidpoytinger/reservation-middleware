@@ -13,14 +13,6 @@ function setCors(res, origin) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function formatUsd(amountNumber) {
-  const n = Number(amountNumber);
-  if (!Number.isFinite(n)) return "";
-  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
-}
-
-// Keep idempotency keys ASCII + <=255 chars.
-// This creates a deterministic short hash (not crypto, just stable).
 function shortHash(input) {
   const s = String(input || "");
   let h = 0;
@@ -44,81 +36,42 @@ export default async function handler(req, res) {
     const idkey = body.idkey || body.IDKEY || body.IdKey;
     if (!idkey) return res.status(400).json({ error: "Missing idkey" });
 
-    // 1) Pull reservation data from Caspio
     const reservation = await getReservationByIdKey(idkey);
 
     const customerEmail = reservation.Email;
     const bookingFeeAmount = Number(reservation.BookingFeeAmount);
 
-    const peopleText = (reservation.People_Text ?? "").toString().trim();
-    const sessionsTitle = (reservation.Sessions_Title ?? "").toString().trim();
     const chargeType = (reservation.Charge_Type ?? "").toString().trim();
+    const sessionsTitle = (reservation.Sessions_Title ?? "").toString().trim();
+    const peopleText = (reservation.People_Text ?? "").toString().trim();
 
     if (!customerEmail) return res.status(400).json({ error: "Missing Email on reservation" });
     if (!bookingFeeAmount || bookingFeeAmount <= 0) {
       return res.status(400).json({ error: "Missing/invalid BookingFeeAmount on reservation" });
     }
 
-    // Stripe amounts
     const unitAmount = Math.round(bookingFeeAmount * 100);
-    const amountDisplay = formatUsd(bookingFeeAmount);
 
-    // Display strings
-    const displaySessionsTitle = sessionsTitle || "Your Reservation";
-    const displayPeopleText = peopleText || "";
-
-    // ✅ CHANGE: fallback should stay "Booking Fee" so it matches current behavior when blank
-    // and ensures the left-side title is never "Amount Due Now" unless you want it.
-    const displayChargeType = chargeType || "Booking Fee";
-
-    // LEFT COLUMN (Order summary) — Stripe reliably shows ONLY the name + amount
-    // ✅ This is the change you asked for: replace “Booking Fee” with [Charge_Type]
-    const productName = displayChargeType;
-
-    // (Descriptions are often NOT shown by Stripe Checkout, but safe to keep.)
-    const productDescription = [
-      "What You Are Booking",
-      displaySessionsTitle,
-      displayPeopleText,
-      "",
-      "What You Owe Now",
-      `${displayChargeType}: ${amountDisplay}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    // Message near the pay button (right column)
-    const submitMessage = [
-      "What You Are Booking",
-      displaySessionsTitle,
-      displayPeopleText,
-      "",
-      "What You Owe Now",
-      `${displayChargeType}: ${amountDisplay}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    // ✅ LEFT column title on Stripe Checkout
+    const productName = chargeType || "Booking Fee";
 
     const sharedMetadata = {
       reservation_id: String(idkey),
       purpose: "booking_fee",
-      Charge_Type: displayChargeType,
-      Sessions_Title: displaySessionsTitle,
-      People_Text: displayPeopleText,
+      Charge_Type: productName,
+      Sessions_Title: sessionsTitle || "",
+      People_Text: peopleText || "",
     };
 
-    // ✅ SMART idempotency key:
-    // changes if amount, charge type, title, or people text changes
     const idemKey = [
       "RES",
       String(idkey),
       unitAmount,
-      shortHash(displayChargeType),
-      shortHash(displaySessionsTitle),
-      shortHash(displayPeopleText),
+      shortHash(productName),
+      shortHash(sessionsTitle),
+      shortHash(peopleText),
     ].join("_");
 
-    // 2) Create Stripe Checkout Session (with idempotency)
     const session = await stripe.checkout.sessions.create(
       {
         mode: "payment",
@@ -129,10 +82,7 @@ export default async function handler(req, res) {
             quantity: 1,
             price_data: {
               currency: "usd",
-              product_data: {
-                name: productName, // ✅ left-side title
-                description: productDescription,
-              },
+              product_data: { name: productName },
               unit_amount: unitAmount,
             },
           },
@@ -142,24 +92,16 @@ export default async function handler(req, res) {
           setup_future_usage: "off_session",
           metadata: sharedMetadata,
         },
-
         metadata: sharedMetadata,
-
-        custom_text: {
-          submit: { message: submitMessage },
-        },
 
         success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?idkey=${encodeURIComponent(idkey)}`,
         cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
       },
-      {
-        idempotencyKey: idemKey,
-      }
+      { idempotencyKey: idemKey }
     );
 
-    // 3) Optional: write "pending" status + session id back to Caspio for traceability
+    // Optional "pending" writeback
     const where = buildWhereForIdKey(idkey);
-
     await updateReservationByWhere(where, {
       PaymentStatus: "PendingBookingFee",
       StripeCheckoutSessionId: session.id,
@@ -175,3 +117,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: err.message || "Server error" });
   }
 }
+
