@@ -4,7 +4,7 @@ import {
   buildWhereForIdKey,
   insertTransactionIfMissingByRawEventId,
   getReservationByIdKey,
-  getResBillingEditViewRowByIdKey, // ✅ NEW: view helper
+  getResBillingEditViewRowByIdKey, // view helper: SIGMA_VW_Res_Billing_Edit by IDKEY
 } from "../../lib/caspio";
 
 export const config = { api: { bodyParser: false } };
@@ -28,6 +28,7 @@ export default async function handler(req, res) {
     caspioTable: process.env.CASPIO_TABLE || null,
     caspioKeyField: process.env.CASPIO_KEY_FIELD || null,
     caspioTxnTable: process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions",
+    caspioResBillingView: process.env.CASPIO_RES_BILLING_VIEW || "SIGMA_VW_Res_Billing_Edit",
   });
 
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -99,7 +100,30 @@ export default async function handler(req, res) {
 
     const where = buildWhereForIdKey(idkey);
 
-    // 1) Update reservation row (unchanged)
+    // -------------------------
+    // Pull Email_Design from VIEW (so we only update once)
+    // Map: SIGMA_VW_Res_Billing_Edit.BAR2_Email_Design_Email_Content -> BAR2_Reservations_SIGMA.Email_Design
+    // -------------------------
+    let emailDesignFromView = null;
+    try {
+      const viewRow = await getResBillingEditViewRowByIdKey(idkey);
+      emailDesignFromView = viewRow?.BAR2_Email_Design_Email_Content || null;
+
+      if (emailDesignFromView) {
+        console.log("✅ VIEW_EMAIL_DESIGN_FOUND", { idkey });
+      } else {
+        console.log("ℹ️ VIEW_EMAIL_DESIGN_EMPTY", { idkey });
+      }
+    } catch (e) {
+      console.warn("⚠️ VIEW_EMAIL_DESIGN_LOOKUP_FAILED (non-blocking)", {
+        idkey,
+        message: e?.message || String(e),
+      });
+    }
+
+    // -------------------------
+    // 1) Update reservation row (single update)
+    // -------------------------
     const payload = {
       BookingFeePaidAt: paidAtIso,
       StripeCheckoutSessionId: fullSession.id,
@@ -119,35 +143,13 @@ export default async function handler(req, res) {
       Transaction_date: paidAtIso,
     };
 
+    // ✅ Only set Email_Design if we actually got a non-empty value from the view
+    if (emailDesignFromView && emailDesignFromView !== "") {
+      payload.Email_Design = emailDesignFromView;
+    }
+
     const result = await updateReservationByWhere(where, payload);
     console.log("✅ CASPIO_UPDATE_OK", { idkey, where, result });
-
-    // ✅ NEW: Map from VIEW -> Reservation table
-    // Map: SIGMA_VW_Res_Billing_Edit.BAR2_Email_Design_Email_Content -> BAR2_Reservations_SIGMA.Email_Design
-    try {
-      const viewRow = await getResBillingEditViewRowByIdKey(idkey);
-
-      if (viewRow) {
-        const emailDesignContent = viewRow.BAR2_Email_Design_Email_Content;
-
-        if (emailDesignContent && emailDesignContent !== "") {
-          await updateReservationByWhere(buildWhereForIdKey(idkey), {
-            Email_Design: emailDesignContent,
-          });
-
-          console.log("✅ VIEW_EMAIL_DESIGN_SYNC_OK", { idkey });
-        } else {
-          console.log("ℹ️ VIEW_EMAIL_DESIGN_EMPTY", { idkey });
-        }
-      } else {
-        console.log("ℹ️ VIEW_ROW_NOT_FOUND", { idkey, view: "SIGMA_VW_Res_Billing_Edit" });
-      }
-    } catch (e) {
-      console.warn("⚠️ VIEW_EMAIL_DESIGN_SYNC_FAILED (non-blocking)", {
-        idkey,
-        message: e?.message || String(e),
-      });
-    }
 
     // ✅ Load reservation to read Charge_Type for Description
     let reservationRow = null;
@@ -159,7 +161,9 @@ export default async function handler(req, res) {
 
     const reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
 
+    // -------------------------
     // 2) Insert Transaction History record (Description from reservation Charge_Type)
+    // -------------------------
     const txnPayload = {
       IDKEY: String(idkey),
 
