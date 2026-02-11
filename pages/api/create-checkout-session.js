@@ -4,10 +4,7 @@ import { getReservationByIdKey, updateReservationByWhere, buildWhereForIdKey } f
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 function setCors(res, origin) {
-  // Weebly site origin
   const allowed = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
-
-  // If request comes from allowed origin, echo it back; otherwise still allow the configured origin.
   const allowOrigin = origin && origin === allowed ? origin : allowed;
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -22,20 +19,20 @@ function formatUsd(amountNumber) {
   return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
+// Keep idempotency keys ASCII + <=255 chars.
+// This creates a deterministic short hash (not crypto, just stable).
+function shortHash(input) {
+  const s = String(input || "");
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+}
+
 export default async function handler(req, res) {
-  // ✅ CORS for browser calls (Weebly -> Vercel is cross-origin)
   setCors(res, req.headers.origin);
 
-  // ✅ Preflight (this is what fixes "Failed to fetch")
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  // Handy browser sanity check (optional)
-  if (req.method === "GET") {
-    return res.status(200).json({ ok: true, route: "create-checkout-session" });
-  }
-
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "GET") return res.status(200).json({ ok: true, route: "create-checkout-session" });
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
   try {
@@ -43,10 +40,8 @@ export default async function handler(req, res) {
     if (!process.env.SITE_BASE_URL) return res.status(500).json({ error: "Missing SITE_BASE_URL" });
     if (!process.env.CASPIO_TABLE) return res.status(500).json({ error: "Missing CASPIO_TABLE" });
 
-    // Accept either casing from client
     const body = req.body || {};
     const idkey = body.idkey || body.IDKEY || body.IdKey;
-
     if (!idkey) return res.status(400).json({ error: "Missing idkey" });
 
     // 1) Pull reservation data from Caspio
@@ -55,7 +50,6 @@ export default async function handler(req, res) {
     const customerEmail = reservation.Email;
     const bookingFeeAmount = Number(reservation.BookingFeeAmount);
 
-    // ✅ Pull the fields you want shown/passed to Stripe
     const peopleText = (reservation.People_Text ?? "").toString().trim();
     const sessionsTitle = (reservation.Sessions_Title ?? "").toString().trim();
     const chargeType = (reservation.Charge_Type ?? "").toString().trim();
@@ -69,26 +63,24 @@ export default async function handler(req, res) {
     const unitAmount = Math.round(bookingFeeAmount * 100);
     const amountDisplay = formatUsd(bookingFeeAmount);
 
-    // Display strings (safe fallbacks)
+    // Display strings
     const displaySessionsTitle = sessionsTitle || "Your Reservation";
     const displayPeopleText = peopleText || "";
     const displayChargeType = chargeType || "Amount Due Now";
 
-    // -----
-    // DISPLAY IN STRIPE CHECKOUT (best approximation of your requested layout)
-    // -----
-    // Line item name shows next to the amount, so make it Charge_Type.
-    // Description shows right under the line item name.
-    const lineItemName = displayChargeType;
+    // LEFT COLUMN (Order summary)
+    const productName = displayChargeType;
 
-    const lineItemDescription = [
+    const productDescription = [
       "What You Are Booking",
       displaySessionsTitle,
       displayPeopleText,
-    ]
-      .filter(Boolean)
-      .join("\n");
+      "",
+      "What You Owe Now",
+      `${displayChargeType}: ${amountDisplay}`,
+    ].filter(Boolean).join("\n");
 
+    // Message near the pay button (right column)
     const submitMessage = [
       "What You Are Booking",
       displaySessionsTitle,
@@ -96,11 +88,8 @@ export default async function handler(req, res) {
       "",
       "What You Owe Now",
       `${displayChargeType}: ${amountDisplay}`,
-    ]
-      .filter((v) => v !== undefined && v !== null)
-      .join("\n");
+    ].filter(Boolean).join("\n");
 
-    // Metadata for webhook/reporting
     const sharedMetadata = {
       reservation_id: String(idkey),
       purpose: "booking_fee",
@@ -108,6 +97,18 @@ export default async function handler(req, res) {
       Sessions_Title: displaySessionsTitle,
       People_Text: displayPeopleText,
     };
+
+    // ✅ SMART idempotency key:
+    // changes if amount, charge type, title, or people text changes
+    // (so you don't have to keep bumping versions)
+    const idemKey = [
+      "RES",
+      String(idkey),
+      unitAmount,
+      shortHash(displayChargeType),
+      shortHash(displaySessionsTitle),
+      shortHash(displayPeopleText),
+    ].join("_");
 
     // 2) Create Stripe Checkout Session (with idempotency)
     const session = await stripe.checkout.sessions.create(
@@ -120,48 +121,31 @@ export default async function handler(req, res) {
             quantity: 1,
             price_data: {
               currency: "usd",
-             product_data: {
-  // This becomes the BIG title on the left
-  name: displayChargeType,  // e.g. "Booking Fee", "Deposit", "Balance Due"
-
-  // This becomes the smaller text under it (Stripe may show it, depending on layout)
-  description: [
-    "What You Are Booking",
-    displaySessionsTitle,
-    displayPeopleText,
-    "",
-    "What You Owe Now",
-    `${displayChargeType}: ${amountDisplay}`,
-  ].filter(Boolean).join("\n"),
-},
+              product_data: {
+                name: productName,
+                description: productDescription,
+              },
               unit_amount: unitAmount,
             },
           },
         ],
 
-        // Save card for later off-session policy enforcement
         payment_intent_data: {
           setup_future_usage: "off_session",
           metadata: sharedMetadata,
         },
 
-        // Also attach to Checkout Session itself (easy to read in webhook)
         metadata: sharedMetadata,
 
-        // Message near the pay button
         custom_text: {
           submit: { message: submitMessage },
         },
 
-        // Weebly pages
         success_url: `${process.env.SITE_BASE_URL}/barresv5confirmed?idkey=${encodeURIComponent(idkey)}`,
         cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
       },
       {
-        // ✅ prevents duplicate sessions on retry/double-click
-        - idempotencyKey: `RES_${idkey}_checkout_v2`,
-+ idempotencyKey: `RES_${idkey}_checkout_v3`,
-
+        idempotencyKey: idemKey, // ✅ fixed + smart
       }
     );
 
@@ -173,7 +157,6 @@ export default async function handler(req, res) {
       StripeCheckoutSessionId: session.id,
     });
 
-    // ✅ Return both keys so your front-end can use either
     return res.status(200).json({
       url: session.url,
       checkoutUrl: session.url,
