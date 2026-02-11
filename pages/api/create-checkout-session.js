@@ -66,11 +66,16 @@ export default async function handler(req, res) {
     // Display strings
     const displaySessionsTitle = sessionsTitle || "Your Reservation";
     const displayPeopleText = peopleText || "";
-    const displayChargeType = chargeType || "Amount Due Now";
 
-    // LEFT COLUMN (Order summary)
+    // ✅ CHANGE: fallback should stay "Booking Fee" so it matches current behavior when blank
+    // and ensures the left-side title is never "Amount Due Now" unless you want it.
+    const displayChargeType = chargeType || "Booking Fee";
+
+    // LEFT COLUMN (Order summary) — Stripe reliably shows ONLY the name + amount
+    // ✅ This is the change you asked for: replace “Booking Fee” with [Charge_Type]
     const productName = displayChargeType;
 
+    // (Descriptions are often NOT shown by Stripe Checkout, but safe to keep.)
     const productDescription = [
       "What You Are Booking",
       displaySessionsTitle,
@@ -78,7 +83,9 @@ export default async function handler(req, res) {
       "",
       "What You Owe Now",
       `${displayChargeType}: ${amountDisplay}`,
-    ].filter(Boolean).join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     // Message near the pay button (right column)
     const submitMessage = [
@@ -88,7 +95,9 @@ export default async function handler(req, res) {
       "",
       "What You Owe Now",
       `${displayChargeType}: ${amountDisplay}`,
-    ].filter(Boolean).join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     const sharedMetadata = {
       reservation_id: String(idkey),
@@ -100,7 +109,6 @@ export default async function handler(req, res) {
 
     // ✅ SMART idempotency key:
     // changes if amount, charge type, title, or people text changes
-    // (so you don't have to keep bumping versions)
     const idemKey = [
       "RES",
       String(idkey),
@@ -122,7 +130,7 @@ export default async function handler(req, res) {
             price_data: {
               currency: "usd",
               product_data: {
-                name: productName,
+                name: productName, // ✅ left-side title
                 description: productDescription,
               },
               unit_amount: unitAmount,
@@ -145,7 +153,7 @@ export default async function handler(req, res) {
         cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
       },
       {
-        idempotencyKey: idemKey, // ✅ fixed + smart
+        idempotencyKey: idemKey,
       }
     );
 
