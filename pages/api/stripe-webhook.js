@@ -1,5 +1,9 @@
 import Stripe from "stripe";
-import { updateReservationByWhere, buildWhereForIdKey } from "../../lib/caspio";
+import {
+  updateReservationByWhere,
+  buildWhereForIdKey,
+  insertTransactionIfMissingByRawEventId, // ✅ NEW
+} from "../../lib/caspio";
 
 export const config = { api: { bodyParser: false } };
 
@@ -22,6 +26,7 @@ export default async function handler(req, res) {
     caspioIntegrationUrlHost: process.env.CASPIO_INTEGRATION_URL || null,
     caspioTable: process.env.CASPIO_TABLE || null,
     caspioKeyField: process.env.CASPIO_KEY_FIELD || null,
+    caspioTxnTable: process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions", // ✅ NEW (debug)
   });
 
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -59,20 +64,45 @@ export default async function handler(req, res) {
 
     let paymentIntent = fullSession.payment_intent;
     if (typeof paymentIntent === "string") {
-      paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent, { expand: ["payment_method"] });
+      paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent, {
+        expand: ["payment_method", "charges.data.payment_method_details"], // ✅ expand charge card details too
+      });
     } else if (paymentIntent && typeof paymentIntent !== "string") {
       if (typeof paymentIntent.payment_method === "string") {
-        paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, { expand: ["payment_method"] });
+        paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, {
+          expand: ["payment_method", "charges.data.payment_method_details"], // ✅ expand charge card details too
+        });
+      } else {
+        // even if already expanded, charges may not be
+        paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, {
+          expand: ["payment_method", "charges.data.payment_method_details"], // ✅ expand charge card details too
+        });
       }
     }
 
     const customerId =
-      typeof fullSession.customer === "string" ? fullSession.customer : fullSession.customer?.id || null;
+      typeof fullSession.customer === "string"
+        ? fullSession.customer
+        : fullSession.customer?.id || null;
 
     const paymentIntentId = paymentIntent?.id || null;
 
     const pm = paymentIntent?.payment_method;
-    const card = pm && typeof pm !== "string" ? pm.card : null;
+    const cardFromPM = pm && typeof pm !== "string" ? pm.card : null;
+
+    // ✅ Prefer card details from the Charge (more reliable for brand/last4)
+    const charge = paymentIntent?.charges?.data?.[0];
+    const cardFromCharge = charge?.payment_method_details?.card || null;
+
+    const card = cardFromCharge || cardFromPM;
+
+    // Amount / currency for transaction log
+    const amountCents = paymentIntent?.amount_received ?? paymentIntent?.amount ?? null;
+    const amountDollars =
+      typeof amountCents === "number" ? Number((amountCents / 100).toFixed(2)) : null;
+
+    const currency = paymentIntent?.currency ? String(paymentIntent.currency).toLowerCase() : "usd";
+    const chargeId = charge?.id || null;
 
     const paidAtIso = new Date(
       (fullSession.created || Math.floor(Date.now() / 1000)) * 1000
@@ -80,6 +110,9 @@ export default async function handler(req, res) {
 
     const where = buildWhereForIdKey(idkey);
 
+    // -------------------------
+    // 1) Update reservation row
+    // -------------------------
     const payload = {
       BookingFeePaidAt: paidAtIso,
       StripeCheckoutSessionId: fullSession.id,
@@ -94,7 +127,8 @@ export default async function handler(req, res) {
       Token_ID: customerId,
       Card_brand: card?.brand || null,
       Card_number_masked: card?.last4 ? `**** **** **** ${card.last4}` : null,
-      Card_expiration: card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
+      Card_expiration:
+        card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
       Transaction_ID: paymentIntentId,
       Transaction_date: paidAtIso,
     };
@@ -102,6 +136,61 @@ export default async function handler(req, res) {
     const result = await updateReservationByWhere(where, payload);
 
     console.log("✅ CASPIO_UPDATE_OK", { idkey, where, result });
+
+    // ------------------------------------
+    // 2) Insert Transaction History record
+    // ------------------------------------
+    // Idempotent by Stripe Event ID (RawEventId). Webhooks may retry.
+    // This will SKIP if RawEventId already exists.
+    const txnPayload = {
+      IDKEY: String(idkey),
+
+      BookingFee: amountDollars, // number
+      Amount: amountDollars,     // number
+      Currency: currency,
+
+      PaymentStatus: "PaidBookingFee",
+      Status: String(paymentIntent?.status || "succeeded"),
+
+      StripeCheckoutSessionId: String(fullSession.id),
+      StripePaymentIntentId: String(paymentIntentId || ""),
+      StripeChargeId: String(chargeId || ""),
+      StripeCustomerId: String(customerId || ""),
+
+      Payment_processor: "stripe",
+      Payment_service: "checkout",
+      Mode: fullSession.livemode ? "live" : "test",
+
+      Charge_Type: "booking_fee",
+      Description: "Booking Fee",
+
+      // PCI-safe summary
+      PaymentMethodBrand: card?.brand || null,
+      PaymentMethodLast4: card?.last4 || null,
+      Card_brand: card?.brand || null,
+      Card_number_masked: card?.last4 ? `**** **** **** ${card.last4}` : null,
+      Card_expiration:
+        card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
+
+      Transaction_ID: chargeId || paymentIntentId || null,
+      Transaction_date: paidAtIso,
+      BookingFeePaidAt: paidAtIso,
+      CreatedAt: new Date().toISOString(),
+
+      RawEventId: String(event.id), // ✅ idempotency key
+    };
+
+    try {
+      const txnResult = await insertTransactionIfMissingByRawEventId(txnPayload);
+      console.log("✅ TXN_INSERT_OK", { idkey, eventId: event.id, txnResult });
+    } catch (e) {
+      // Non-blocking: reservation is already updated; don't fail webhook
+      console.error("⚠️ TXN_INSERT_FAILED (non-blocking)", {
+        idkey,
+        eventId: event.id,
+        message: e?.message || String(e),
+      });
+    }
 
     // ✅ Always return 200 to Stripe
     return res.status(200).json({ received: true });
