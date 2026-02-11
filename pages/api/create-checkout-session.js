@@ -149,7 +149,7 @@ export default async function handler(req, res) {
       },
       {
         // ✅ prevents duplicate sessions on retry/double-click
-        idempotencyKey: `RES_${idkey}_checkout_v1`,
+        idempotencyKey: `RES_${idkey}_checkout_v2`,
       }
     );
 
