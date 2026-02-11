@@ -2,7 +2,8 @@ import Stripe from "stripe";
 import {
   updateReservationByWhere,
   buildWhereForIdKey,
-  insertTransactionIfMissingByRawEventId, // ✅ NEW
+  insertTransactionIfMissingByRawEventId,
+  getReservationByIdKey, // ✅ NEW
 } from "../../lib/caspio";
 
 export const config = { api: { bodyParser: false } };
@@ -18,7 +19,6 @@ async function buffer(readable) {
 }
 
 export default async function handler(req, res) {
-  // ✅ PROVE which deployment Stripe is hitting
   console.log("WEBHOOK_HIT", {
     host: req.headers.host,
     url: req.url,
@@ -26,7 +26,7 @@ export default async function handler(req, res) {
     caspioIntegrationUrlHost: process.env.CASPIO_INTEGRATION_URL || null,
     caspioTable: process.env.CASPIO_TABLE || null,
     caspioKeyField: process.env.CASPIO_KEY_FIELD || null,
-    caspioTxnTable: process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions", // ✅ NEW (debug)
+    caspioTxnTable: process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions",
   });
 
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -39,11 +39,9 @@ export default async function handler(req, res) {
     event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error("❌ Stripe signature verification failed:", err.message);
-    // Still OK to return 400 here (Stripe will retry if misconfigured)
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Only handle this event type
   if (event.type !== "checkout.session.completed") {
     return res.status(200).json({ received: true });
   }
@@ -53,7 +51,6 @@ export default async function handler(req, res) {
 
   if (!idkey) {
     console.error("❌ Missing metadata.reservation_id on Stripe session", { sessionId: session?.id });
-    // Return 200 so Stripe doesn't keep retrying forever
     return res.status(200).json({ received: true });
   }
 
@@ -65,19 +62,12 @@ export default async function handler(req, res) {
     let paymentIntent = fullSession.payment_intent;
     if (typeof paymentIntent === "string") {
       paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent, {
-        expand: ["payment_method", "charges.data.payment_method_details"], // ✅ expand charge card details too
+        expand: ["payment_method", "charges.data.payment_method_details"],
       });
     } else if (paymentIntent && typeof paymentIntent !== "string") {
-      if (typeof paymentIntent.payment_method === "string") {
-        paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, {
-          expand: ["payment_method", "charges.data.payment_method_details"], // ✅ expand charge card details too
-        });
-      } else {
-        // even if already expanded, charges may not be
-        paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, {
-          expand: ["payment_method", "charges.data.payment_method_details"], // ✅ expand charge card details too
-        });
-      }
+      paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent.id, {
+        expand: ["payment_method", "charges.data.payment_method_details"],
+      });
     }
 
     const customerId =
@@ -90,13 +80,11 @@ export default async function handler(req, res) {
     const pm = paymentIntent?.payment_method;
     const cardFromPM = pm && typeof pm !== "string" ? pm.card : null;
 
-    // ✅ Prefer card details from the Charge (more reliable for brand/last4)
     const charge = paymentIntent?.charges?.data?.[0];
     const cardFromCharge = charge?.payment_method_details?.card || null;
 
     const card = cardFromCharge || cardFromPM;
 
-    // Amount / currency for transaction log
     const amountCents = paymentIntent?.amount_received ?? paymentIntent?.amount ?? null;
     const amountDollars =
       typeof amountCents === "number" ? Number((amountCents / 100).toFixed(2)) : null;
@@ -110,16 +98,13 @@ export default async function handler(req, res) {
 
     const where = buildWhereForIdKey(idkey);
 
-    // -------------------------
-    // 1) Update reservation row
-    // -------------------------
+    // 1) Update reservation row (unchanged)
     const payload = {
       BookingFeePaidAt: paidAtIso,
       StripeCheckoutSessionId: fullSession.id,
       StripePaymentIntentId: paymentIntentId,
       StripeCustomerId: customerId,
 
-      // Optional extras (remove/rename if your Caspio columns differ)
       Payment_processor: "Stripe",
       Mode: fullSession.livemode ? "live" : "test",
       Status: "Booked",
@@ -134,19 +119,24 @@ export default async function handler(req, res) {
     };
 
     const result = await updateReservationByWhere(where, payload);
-
     console.log("✅ CASPIO_UPDATE_OK", { idkey, where, result });
 
-    // ------------------------------------
-    // 2) Insert Transaction History record
-    // ------------------------------------
-    // Idempotent by Stripe Event ID (RawEventId). Webhooks may retry.
-    // This will SKIP if RawEventId already exists.
+    // ✅ NEW: Load reservation to read Charge_Type for Description
+    let reservationRow = null;
+    try {
+      reservationRow = await getReservationByIdKey(idkey);
+    } catch (e) {
+      console.warn("⚠️ Could not load reservation row for Charge_Type:", e?.message || String(e));
+    }
+
+    const reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
+
+    // 2) Insert Transaction History record (Description from reservation Charge_Type)
     const txnPayload = {
       IDKEY: String(idkey),
 
-      BookingFee: amountDollars, // number
-      Amount: amountDollars,     // number
+      BookingFee: amountDollars,
+      Amount: amountDollars,
       Currency: currency,
 
       PaymentStatus: "PaidBookingFee",
@@ -161,10 +151,9 @@ export default async function handler(req, res) {
       Payment_service: "checkout",
       Mode: fullSession.livemode ? "live" : "test",
 
-      Charge_Type: "booking_fee",
-      Description: "Booking Fee",
+      Charge_Type: reservationChargeType,
+      Description: reservationChargeType,
 
-      // PCI-safe summary
       PaymentMethodBrand: card?.brand || null,
       PaymentMethodLast4: card?.last4 || null,
       Card_brand: card?.brand || null,
@@ -177,14 +166,13 @@ export default async function handler(req, res) {
       BookingFeePaidAt: paidAtIso,
       CreatedAt: new Date().toISOString(),
 
-      RawEventId: String(event.id), // ✅ idempotency key
+      RawEventId: String(event.id),
     };
 
     try {
       const txnResult = await insertTransactionIfMissingByRawEventId(txnPayload);
       console.log("✅ TXN_INSERT_OK", { idkey, eventId: event.id, txnResult });
     } catch (e) {
-      // Non-blocking: reservation is already updated; don't fail webhook
       console.error("⚠️ TXN_INSERT_FAILED (non-blocking)", {
         idkey,
         eventId: event.id,
@@ -192,13 +180,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // ✅ Always return 200 to Stripe
     return res.status(200).json({ received: true });
   } catch (err) {
-    // ✅ Log the real error in Vercel, but do NOT send it back to Stripe
     console.error("❌ CASPIO_UPDATE_FAILED", { idkey, message: err?.message || String(err) });
-
-    // ✅ Always return 200 so Stripe stops showing scary red/failed deliveries
     return res.status(200).json({ received: true });
   }
 }
