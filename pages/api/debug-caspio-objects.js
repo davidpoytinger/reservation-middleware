@@ -39,10 +39,12 @@ export default async function handler(req, res) {
     const base = caspioIntegrationBaseUrl();
 
     // Try v2 then v3 (your other endpoints use both)
-    const candidates = [
-      `${base}/rest/v2/tables`,
-      `${base}/rest/v3/tables`,
-    ];
+const candidates = [
+  `${base}/rest/v2/tables`,
+  `${base}/rest/v3/tables`,
+  `${base}/rest/v2/views`,  // ✅ NEW
+  `${base}/rest/v3/views`,  // ✅ NEW
+];
 
     let lastErr = null;
 
