@@ -1,7 +1,7 @@
 // pages/api/paystart.js
 //
 // Caspio -> /api/paystart?idkey=@IDKEY
-// Creates Stripe Checkout Session and redirects to Stripe.
+// This route creates the Stripe Checkout Session and redirects to Stripe.
 
 import Stripe from "stripe";
 import {
@@ -57,6 +57,7 @@ export default async function handler(req, res) {
     const displayChargeType = chargeTypeRaw || "Booking Fee";
 
     // ✅ Text below the amount: Sessions_Title | People_Text
+    // Keep it one-line so it reads clean even when Stripe wraps.
     const belowAmountText = [sessionsTitle, peopleText].filter(Boolean).join("  |  ").slice(0, 500);
 
     // Metadata for webhook/reporting
@@ -81,16 +82,9 @@ export default async function handler(req, res) {
     const base = String(process.env.SITE_BASE_URL).replace(/\/+$/, "");
     const encodedId = encodeURIComponent(idkey);
 
-    // ✅ Add session_id so we can recover even if idkey is stripped by a redirect
-    const successUrl =
-      `${base}/barresv5custmanage.html` +
-      `?idkey=${encodedId}` +
-      `&session_id={CHECKOUT_SESSION_ID}`;
-
-    const cancelUrl =
-      `${base}/barresv5cancelled.html` +
-      `?idkey=${encodedId}` +
-      `&session_id={CHECKOUT_SESSION_ID}`;
+    // ✅ CLEAN URLs (NO session_id param, as requested)
+    const successUrl = `${base}/barresv5custmanage.html?idkey=${encodedId}`;
+    const cancelUrl = `${base}/barresv5cancelled.html?idkey=${encodedId}`;
 
     // 2) Create Stripe Checkout Session (idempotent)
     const session = await stripe.checkout.sessions.create(
@@ -98,7 +92,7 @@ export default async function handler(req, res) {
         mode: "payment",
         customer_email: customerEmail,
 
-        // ✅ Put IDKEY somewhere Stripe guarantees you can fetch later
+        // ✅ still helpful for recovery/debugging via Stripe dashboard / API
         client_reference_id: String(idkey),
 
         line_items: [
@@ -107,8 +101,8 @@ export default async function handler(req, res) {
             price_data: {
               currency: "usd",
               product_data: {
-                name: displayChargeType,
-                description: belowAmountText,
+                name: displayChargeType,       // ✅ title at top
+                description: belowAmountText,  // ✅ shows below amount
               },
               unit_amount: unitAmount,
             },
@@ -126,9 +120,6 @@ export default async function handler(req, res) {
       },
       { idempotencyKey: idemKey }
     );
-
-    // 🔎 Quick debug (temporary): verify what Stripe will redirect to
-    // console.log("Stripe success_url:", session.success_url);
 
     // 3) Optional Caspio "pending" writeback
     try {
