@@ -104,8 +104,8 @@ export default async function handler(req, res) {
         },
         metadata: sharedMetadata,
 
-        success_url: `${process.env.SITE_BASE_URL}/barresv5custmanage?idkey=${encodeURIComponent(idkey)}`,
-        cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled?idkey=${encodeURIComponent(idkey)}`,
+        success_url: `${process.env.SITE_BASE_URL}/barresv5custmanage.html?idkey=${encodeURIComponent(idkey)}`,
+        cancel_url: `${process.env.SITE_BASE_URL}/barresv5cancelled.html?idkey=${encodeURIComponent(idkey)}`,
       },
       { idempotencyKey: idemKey }
     );
