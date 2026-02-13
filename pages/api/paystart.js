@@ -2,6 +2,7 @@
 //
 // Caspio -> /api/paystart?idkey=@IDKEY
 // This route creates the Stripe Checkout Session and redirects to Stripe.
+// ✅ Updated to pass BOTH IDKEY and RES_ID through Stripe + success/cancel URLs.
 
 import Stripe from "stripe";
 import {
@@ -33,6 +34,7 @@ export default async function handler(req, res) {
     if (!process.env.SITE_BASE_URL) return res.status(500).send("Missing SITE_BASE_URL");
     if (!process.env.CASPIO_TABLE) return res.status(500).send("Missing CASPIO_TABLE");
 
+    // ✅ IDKEY from query
     const idkey = req.query.idkey || req.query.IDKEY || req.query.IdKey;
     if (!idkey) return res.status(400).send("Missing idkey");
 
@@ -46,10 +48,23 @@ export default async function handler(req, res) {
     const peopleText = oneLine(reservation.People_Text);
     const chargeTypeRaw = oneLine(reservation.Charge_Type);
 
+    // ✅ NEW: RES_ID from reservation (handle a few possible casings)
+    const resIdRaw =
+      reservation.RES_ID ??
+      reservation.Res_ID ??
+      reservation.res_id ??
+      reservation.resId ??
+      "";
+
+    const resId = oneLine(resIdRaw);
+
     if (!customerEmail) return res.status(400).send("Missing Email on reservation");
     if (!bookingFeeAmount || bookingFeeAmount <= 0) {
       return res.status(400).send("Missing/invalid BookingFeeAmount on reservation");
     }
+
+    // If you want to REQUIRE RES_ID, uncomment:
+    // if (!resId) return res.status(400).send("Missing RES_ID on reservation");
 
     const unitAmount = Math.round(bookingFeeAmount * 100);
 
@@ -60,31 +75,40 @@ export default async function handler(req, res) {
     // Keep it one-line so it reads clean even when Stripe wraps.
     const belowAmountText = [sessionsTitle, peopleText].filter(Boolean).join("  |  ").slice(0, 500);
 
-    // Metadata for webhook/reporting
+    // ✅ Shared metadata for webhook/reporting (now includes BOTH)
     const sharedMetadata = {
-      reservation_id: String(idkey),
+      IDKEY: String(idkey),
+      RES_ID: resId || "",
+      reservation_id: String(idkey), // kept for backward compatibility with your webhook naming
       purpose: "booking_fee",
       Charge_Type: displayChargeType,
       Sessions_Title: sessionsTitle || "",
       People_Text: peopleText || "",
     };
 
-    // ✅ Smart idempotency: changes if amount or visible text changes
+    // ✅ Smart idempotency: changes if amount or visible text changes (and now RES_ID too)
     const idemKey = [
       "RES",
       String(idkey),
       unitAmount,
       shortHash(displayChargeType),
       shortHash(belowAmountText),
+      shortHash(resId || ""),
     ].join("_");
 
     // Normalize base URL (avoid trailing slash double-slash issues)
     const base = String(process.env.SITE_BASE_URL).replace(/\/+$/, "");
-    const encodedId = encodeURIComponent(idkey);
+    const encodedIdKey = encodeURIComponent(idkey);
 
-    // ✅ CLEAN URLs (NO session_id param, as requested)
-    const successUrl = `${base}/barresv5custmanage.html?idkey=${encodedId}`;
-    const cancelUrl = `${base}/barresv5cancelled.html?idkey=${encodedId}`;
+    // ✅ Pass both IDKEY + RES_ID in the redirect URL
+    // (If your host strips querystrings, Stripe metadata still preserves both.)
+    const successUrl =
+      `${base}/barresv5custmanage.html?idkey=${encodedIdKey}` +
+      (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
+
+    const cancelUrl =
+      `${base}/barresv5cancelled.html?idkey=${encodedIdKey}` +
+      (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
 
     // 2) Create Stripe Checkout Session (idempotent)
     const session = await stripe.checkout.sessions.create(
@@ -92,7 +116,8 @@ export default async function handler(req, res) {
         mode: "payment",
         customer_email: customerEmail,
 
-        // ✅ still helpful for recovery/debugging via Stripe dashboard / API
+        // ✅ Helpful for Stripe dashboard / API recovery
+        // (still set to IDKEY because that’s your external-facing unique key)
         client_reference_id: String(idkey),
 
         line_items: [
@@ -111,9 +136,9 @@ export default async function handler(req, res) {
 
         payment_intent_data: {
           setup_future_usage: "off_session",
-          metadata: sharedMetadata,
+          metadata: sharedMetadata, // ✅ includes IDKEY + RES_ID
         },
-        metadata: sharedMetadata,
+        metadata: sharedMetadata,   // ✅ includes IDKEY + RES_ID
 
         success_url: successUrl,
         cancel_url: cancelUrl,
@@ -127,6 +152,8 @@ export default async function handler(req, res) {
       await updateReservationByWhere(where, {
         PaymentStatus: "PendingBookingFee",
         StripeCheckoutSessionId: session.id,
+        // Optional: only write RES_ID if you actually have a RES_ID column in this table.
+        ...(resId ? { RES_ID: resId } : {}),
       });
     } catch (e) {
       console.warn("Caspio pending writeback skipped/failed:", e?.message || e);
