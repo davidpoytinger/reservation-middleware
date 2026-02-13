@@ -3,6 +3,7 @@
 // Caspio -> /api/paystart?idkey=@IDKEY
 // This route creates the Stripe Checkout Session and redirects to Stripe.
 // ✅ Updated to pass BOTH IDKEY and RES_ID through Stripe + success/cancel URLs.
+// ✅ Updated to force Stripe Customer creation for reliable off-session charging later.
 
 import Stripe from "stripe";
 import {
@@ -48,7 +49,7 @@ export default async function handler(req, res) {
     const peopleText = oneLine(reservation.People_Text);
     const chargeTypeRaw = oneLine(reservation.Charge_Type);
 
-    // ✅ NEW: RES_ID from reservation (handle a few possible casings)
+    // ✅ RES_ID from reservation (handle a few possible casings)
     const resIdRaw =
       reservation.RES_ID ??
       reservation.Res_ID ??
@@ -63,16 +64,12 @@ export default async function handler(req, res) {
       return res.status(400).send("Missing/invalid BookingFeeAmount on reservation");
     }
 
-    // If you want to REQUIRE RES_ID, uncomment:
-    // if (!resId) return res.status(400).send("Missing RES_ID on reservation");
-
     const unitAmount = Math.round(bookingFeeAmount * 100);
 
     // ✅ TOP TITLE (left side): Charge_Type (fallback Booking Fee)
     const displayChargeType = chargeTypeRaw || "Booking Fee";
 
     // ✅ Text below the amount: Sessions_Title | People_Text
-    // Keep it one-line so it reads clean even when Stripe wraps.
     const belowAmountText = [sessionsTitle, peopleText].filter(Boolean).join("  |  ").slice(0, 500);
 
     // ✅ Shared metadata for webhook/reporting (now includes BOTH)
@@ -101,7 +98,6 @@ export default async function handler(req, res) {
     const encodedIdKey = encodeURIComponent(idkey);
 
     // ✅ Pass both IDKEY + RES_ID in the redirect URL
-    // (If your host strips querystrings, Stripe metadata still preserves both.)
     const successUrl =
       `${base}/barresv5custmanage.html?idkey=${encodedIdKey}` +
       (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
@@ -114,10 +110,17 @@ export default async function handler(req, res) {
     const session = await stripe.checkout.sessions.create(
       {
         mode: "payment",
+
+        // ✅ IMPORTANT: ensure a Stripe Customer is always created
+        // This makes off-session charging far more reliable later.
+        customer_creation: "always",
+
         customer_email: customerEmail,
 
-        // ✅ Helpful for Stripe dashboard / API recovery
-        // (still set to IDKEY because that’s your external-facing unique key)
+        // ✅ Optional: Stripe will collect PM only if needed
+        payment_method_collection: "if_required",
+
+        // Helpful for Stripe dashboard / API recovery
         client_reference_id: String(idkey),
 
         line_items: [
@@ -126,19 +129,20 @@ export default async function handler(req, res) {
             price_data: {
               currency: "usd",
               product_data: {
-                name: displayChargeType,       // ✅ title at top
-                description: belowAmountText,  // ✅ shows below amount
+                name: displayChargeType,
+                description: belowAmountText,
               },
               unit_amount: unitAmount,
             },
           },
         ],
 
+        // ✅ Key for future off-session charges
         payment_intent_data: {
           setup_future_usage: "off_session",
-          metadata: sharedMetadata, // ✅ includes IDKEY + RES_ID
+          metadata: sharedMetadata,
         },
-        metadata: sharedMetadata,   // ✅ includes IDKEY + RES_ID
+        metadata: sharedMetadata,
 
         success_url: successUrl,
         cancel_url: cancelUrl,
@@ -152,7 +156,6 @@ export default async function handler(req, res) {
       await updateReservationByWhere(where, {
         PaymentStatus: "PendingBookingFee",
         StripeCheckoutSessionId: session.id,
-        // Optional: only write RES_ID if you actually have a RES_ID column in this table.
         ...(resId ? { RES_ID: resId } : {}),
       });
     } catch (e) {
