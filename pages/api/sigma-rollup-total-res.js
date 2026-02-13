@@ -1,25 +1,14 @@
 // pages/api/sigma-rollup-total-res.js
 
 /**
- * Rollup recalculation endpoint for SIGMA:
- * - Source table BAR2_Reservations_SIGMA has multiple rows per RES_ID
- *   * one row: Type = "Reservation" (case-insensitive)
- *   * many rows: Type = "addon" (case-insensitive)
- *   * numeric field Total on each row
+ * Caspio Outgoing URL webhook -> roll up totals per RES_ID
  *
- * - Target table SIGMA_BAR3_TOTAL_RES has exactly one row per RES_ID (rollup)
- *   * fields: IDKEY, Business_Unit, Status, Subtotal_Primary, Subtotal_Addon, Total
+ * Auth: query string token (?token=...)
  *
- * Auth via query string:
- *   ?token=YOUR_SECRET  (must match SIGMA_WEBHOOK_SECRET env var)
- *
- * Storm guard:
- *  - coalesce concurrent requests per RES_ID
- *  - short TTL cache
- *
- * IMPORTANT:
- * - This version avoids querying by Type in Caspio (which is brittle) and instead:
- *   fetches all rows for RES_ID then splits by Type in JS (case-insensitive).
+ * IMPORTANT FIX:
+ * - Caspio payload structure varies. This version finds RES_ID by:
+ *    1) checking common Caspio fields
+ *    2) deep-searching payload for a key named "RES_ID"
  */
 
 const SOURCE_TABLE = "BAR2_Reservations_SIGMA";
@@ -30,13 +19,11 @@ const TYPE_FIELD = "Type";
 const LINE_TOTAL_FIELD = "Total";
 
 const ROLLUP_KEY_FIELD = "RES_ID";
-
-// Update gating
-const TOTAL_FIELD = LINE_TOTAL_FIELD;
+const TOTAL_FIELD = "Total";
 
 // Storm guard
-const INFLIGHT_BY_RESID = new Map(); // RES_ID -> Promise
-const CACHE_BY_RESID = new Map(); // RES_ID -> { ts, result }
+const INFLIGHT_BY_RESID = new Map();
+const CACHE_BY_RESID = new Map();
 const CACHE_TTL_MS = 1500;
 
 function getCached(resId) {
@@ -56,6 +43,7 @@ function setCached(resId, result) {
   }
 }
 
+// ---------- helpers ----------
 function escWhereValue(v) {
   return String(v).replace(/'/g, "''");
 }
@@ -91,6 +79,115 @@ function fieldChanged(payload, fieldName) {
   return null;
 }
 
+/**
+ * Deep-find first occurrence of keyName within an object (bounded depth).
+ * Returns { value, path } or null.
+ */
+function deepFindKey(obj, keyName, maxDepth = 6) {
+  const seen = new Set();
+
+  function helper(cur, path, depth) {
+    if (cur === null || cur === undefined) return null;
+    if (typeof cur !== "object") return null;
+    if (seen.has(cur)) return null;
+    seen.add(cur);
+
+    // Direct key hit
+    if (Object.prototype.hasOwnProperty.call(cur, keyName)) {
+      return { value: cur[keyName], path: path ? `${path}.${keyName}` : keyName };
+    }
+
+    if (depth >= maxDepth) return null;
+
+    // Arrays
+    if (Array.isArray(cur)) {
+      for (let i = 0; i < cur.length; i++) {
+        const hit = helper(cur[i], `${path}[${i}]`, depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    }
+
+    // Objects
+    for (const k of Object.keys(cur)) {
+      const v = cur[k];
+      const nextPath = path ? `${path}.${k}` : k;
+      const hit = helper(v, nextPath, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  return helper(obj, "", 0);
+}
+
+/**
+ * Try common Caspio webhook shapes first, then deep-search.
+ * Returns { resId, resIdPath, eventTypeRaw, eventType, newData, oldData }
+ */
+function normalizeWebhook(payload) {
+  const p = payload || {};
+
+  const eventTypeRaw = (p.EventType || p.eventType || p.Event || p.event || p.type || "").toString();
+  const eventType = eventTypeRaw.toLowerCase();
+
+  const newData =
+    p.Data ||
+    p.data ||
+    p.NewData ||
+    p.newData ||
+    p.After ||
+    p.after ||
+    p.Record ||
+    p.record ||
+    p.Row ||
+    p.row ||
+    null;
+
+  const oldData =
+    p.OldData ||
+    p.oldData ||
+    p.Before ||
+    p.before ||
+    p.Previous ||
+    p.previous ||
+    null;
+
+  // 1) Direct tries
+  const directResId =
+    newData?.[RES_ID_FIELD] ??
+    oldData?.[RES_ID_FIELD] ??
+    p?.[RES_ID_FIELD] ??
+    null;
+
+  if (directResId !== null && directResId !== undefined && String(directResId).length > 0) {
+    return {
+      resId: directResId,
+      resIdPath: newData?.[RES_ID_FIELD] != null
+        ? "newData.RES_ID"
+        : oldData?.[RES_ID_FIELD] != null
+          ? "oldData.RES_ID"
+          : "payload.RES_ID",
+      eventTypeRaw,
+      eventType,
+      newData: newData || {},
+      oldData: oldData || null,
+    };
+  }
+
+  // 2) Deep search the whole payload
+  const deepHit = deepFindKey(p, RES_ID_FIELD, 6);
+  return {
+    resId: deepHit?.value ?? null,
+    resIdPath: deepHit?.path ?? null,
+    eventTypeRaw,
+    eventType,
+    newData: newData || {},
+    oldData: oldData || null,
+  };
+}
+
+// ---------- Caspio REST helpers ----------
 let tokenCache = { token: null, exp: 0 };
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -159,88 +256,89 @@ async function getRollupRow(resId) {
   return (resp?.Result || [])[0] || null;
 }
 
-function normalizeWebhook(payload) {
-  const p = payload || {};
-  const eventTypeRaw = (p.EventType || p.eventType || p.Event || p.event || "").toString();
-  const eventType = eventTypeRaw.toLowerCase();
-
-  const newData =
-    p.Data || p.data || p.NewData || p.newData || p.After || p.after || p.record || p.Record || null;
-
-  const oldData =
-    p.OldData || p.oldData || p.Before || p.before || p.Previous || p.previous || null;
-
-  return { eventTypeRaw, eventType, newData: newData || {}, oldData };
-}
-
+// ---------- handler ----------
 export default async function handler(req, res) {
   try {
-    // Auth via query param (Caspio-friendly)
+    // Auth via query token (Caspio-friendly)
     const token = req.query?.token;
     if (!process.env.SIGMA_WEBHOOK_SECRET || token !== process.env.SIGMA_WEBHOOK_SECRET) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
     const payload = req.body || {};
-    const { eventTypeRaw, eventType, newData, oldData } = normalizeWebhook(payload);
+    const norm = normalizeWebhook(payload);
 
-    const RES_ID = newData?.[RES_ID_FIELD] ?? oldData?.[RES_ID_FIELD];
+    const eventTypeRaw = norm.eventTypeRaw || "unknown";
+    const eventType = norm.eventType || "";
+    const newData = norm.newData || {};
+    const oldData = norm.oldData || null;
+
+    const RES_ID = norm.resId;
+
     if (!RES_ID) {
-      // return 200 so Caspio doesn’t mark as failed/retry
-      return res.status(200).json({ ok: true, skipped: true, reason: "Missing RES_ID", eventType: eventTypeRaw });
+      // Return 200 so Caspio doesn't keep retrying; include breadcrumbs.
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "Missing RES_ID",
+        eventType: eventTypeRaw,
+        debug: {
+          topLevelKeys: Object.keys(payload || {}),
+          resIdPath: norm.resIdPath,
+        },
+      });
     }
 
-    // Gate UPDATE events: only run if Total changed when verifiable
+    // Gate UPDATE events: only run if Total changed WHEN verifiable
     if (eventType.includes("update")) {
       if (oldData && (TOTAL_FIELD in oldData) && (TOTAL_FIELD in newData)) {
         if (sameNumber(oldData[TOTAL_FIELD], newData[TOTAL_FIELD])) {
-          return res.status(200).json({ ok: true, skipped: true, reason: "Total unchanged on update", RES_ID });
+          return res.status(200).json({
+            ok: true,
+            skipped: true,
+            reason: "Total unchanged on update",
+            RES_ID,
+            eventType: eventTypeRaw,
+          });
         }
       } else {
         const changed = fieldChanged(payload, TOTAL_FIELD);
         if (changed === false) {
-          return res.status(200).json({ ok: true, skipped: true, reason: "Total not in changed-fields list", RES_ID });
+          return res.status(200).json({
+            ok: true,
+            skipped: true,
+            reason: "Total not in changed-fields list",
+            RES_ID,
+            eventType: eventTypeRaw,
+          });
         }
         // unknown -> proceed for correctness
       }
     }
 
     // Storm guard cache
-    const cached = getCached(RES_ID);
+    const cached = getCached(String(RES_ID));
     if (cached) return res.status(200).json({ ...cached, coalesced: "cache" });
 
     // Coalesce in-flight
-    if (INFLIGHT_BY_RESID.has(RES_ID)) {
-      const shared = await INFLIGHT_BY_RESID.get(RES_ID);
+    if (INFLIGHT_BY_RESID.has(String(RES_ID))) {
+      const shared = await INFLIGHT_BY_RESID.get(String(RES_ID));
       return res.status(200).json({ ...shared, coalesced: "inflight" });
     }
 
     const workPromise = (async () => {
-      // 1) Pull ALL source rows for RES_ID (no brittle where Type='addon' etc)
+      // 1) Pull all source rows for RES_ID
       const rows = await getAllSourceRowsForResId(RES_ID);
 
-      // Split by Type case-insensitively + trim
       const typeOf = (r) => String(r?.[TYPE_FIELD] ?? "").trim().toLowerCase();
-
       const reservationRow = rows.find((r) => typeOf(r) === "reservation") || null;
       const addonRows = rows.filter((r) => typeOf(r) === "addon");
 
-      // 2) Compute totals
-      const IDKEY = reservationRow?.IDKEY ?? null;
-      const Business_Unit = reservationRow?.Business_Unit ?? null;
-      const Status = reservationRow?.Status ?? null;
-
-      const Subtotal_Primary = toNum(reservationRow?.[LINE_TOTAL_FIELD]);
-      const Subtotal_Addon = addonRows.reduce((sum, r) => sum + toNum(r?.[LINE_TOTAL_FIELD]), 0);
-      const Total = Subtotal_Primary + Subtotal_Addon;
-
-      // 3) Upsert/Delete rollup row
+      // 2) If nothing remains, delete rollup if exists
       const existing = await getRollupRow(RES_ID);
       const rollupWhere = `${ROLLUP_KEY_FIELD}='${escWhereValue(RES_ID)}'`;
 
-      // If nothing remains for RES_ID, delete rollup if exists
-      const nothingRemains = rows.length === 0;
-      if (nothingRemains) {
+      if (rows.length === 0) {
         if (existing) {
           await caspioFetch(
             `/rest/v2/tables/${ROLLUP_TABLE}/records?q.where=${encodeURIComponent(rollupWhere)}`,
@@ -251,9 +349,18 @@ export default async function handler(req, res) {
           ok: true,
           action: existing ? "deleted_rollup" : "no_rollup_to_delete",
           RES_ID,
-          debug: { sourceRowCount: rows.length },
+          debug: { sourceRowCount: 0, resIdPath: norm.resIdPath },
         };
       }
+
+      // 3) Compute totals + copy fields from reservation row
+      const IDKEY = reservationRow?.IDKEY ?? null;
+      const Business_Unit = reservationRow?.Business_Unit ?? null;
+      const Status = reservationRow?.Status ?? null;
+
+      const Subtotal_Primary = toNum(reservationRow?.[LINE_TOTAL_FIELD]);
+      const Subtotal_Addon = addonRows.reduce((sum, r) => sum + toNum(r?.[LINE_TOTAL_FIELD]), 0);
+      const Total = Subtotal_Primary + Subtotal_Addon;
 
       const upsertBody = {
         [ROLLUP_KEY_FIELD]: RES_ID,
@@ -281,6 +388,7 @@ export default async function handler(req, res) {
             addonCount: addonRows.length,
             Subtotal_Primary,
             Subtotal_Addon,
+            resIdPath: norm.resIdPath,
           },
         };
       } else {
@@ -299,23 +407,28 @@ export default async function handler(req, res) {
             addonCount: addonRows.length,
             Subtotal_Primary,
             Subtotal_Addon,
+            resIdPath: norm.resIdPath,
           },
         };
       }
     })();
 
-    INFLIGHT_BY_RESID.set(RES_ID, workPromise);
+    INFLIGHT_BY_RESID.set(String(RES_ID), workPromise);
 
     try {
       const result = await workPromise;
-      setCached(RES_ID, result);
+      setCached(String(RES_ID), result);
       return res.status(200).json({ ...result, coalesced: "fresh" });
     } finally {
-      INFLIGHT_BY_RESID.delete(RES_ID);
+      INFLIGHT_BY_RESID.delete(String(RES_ID));
     }
   } catch (err) {
     console.error("sigma-rollup-total-res error:", err);
-    // Return 200 so Caspio doesn't keep retrying; error is still visible in logs.
-    return res.status(200).json({ ok: false, error: "rollup_failed", detail: String(err?.message || err) });
+    // Return 200 so Caspio doesn't retry forever; error still visible in logs.
+    return res.status(200).json({
+      ok: false,
+      error: "rollup_failed",
+      detail: String(err?.message || err),
+    });
   }
 }
