@@ -1,9 +1,11 @@
 // pages/api/paystart.js
 //
 // Caspio -> /api/paystart?idkey=@IDKEY
-// This route creates the Stripe Checkout Session and redirects to Stripe.
-// ✅ Updated to pass BOTH IDKEY and RES_ID through Stripe + success/cancel URLs.
-// ✅ Updated to force Stripe Customer creation for reliable off-session charging later.
+// Creates a Stripe Checkout Session and redirects to Stripe.
+//
+// ✅ Passes BOTH IDKEY and RES_ID through Stripe + success/cancel URLs.
+// ✅ Forces Stripe Customer creation AND payment method collection
+//    so we can reliably charge off-session later.
 
 import Stripe from "stripe";
 import {
@@ -18,8 +20,7 @@ function oneLine(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-// Keep idempotency keys ASCII + <=255 chars.
-// Deterministic short hash (not crypto, just stable).
+// Deterministic short hash (not crypto, just stable)
 function shortHash(input) {
   const s = String(input || "");
   let h = 0;
@@ -35,7 +36,7 @@ export default async function handler(req, res) {
     if (!process.env.SITE_BASE_URL) return res.status(500).send("Missing SITE_BASE_URL");
     if (!process.env.CASPIO_TABLE) return res.status(500).send("Missing CASPIO_TABLE");
 
-    // ✅ IDKEY from query
+    // IDKEY from query
     const idkey = req.query.idkey || req.query.IDKEY || req.query.IdKey;
     if (!idkey) return res.status(400).send("Missing idkey");
 
@@ -49,7 +50,6 @@ export default async function handler(req, res) {
     const peopleText = oneLine(reservation.People_Text);
     const chargeTypeRaw = oneLine(reservation.Charge_Type);
 
-    // ✅ RES_ID from reservation (handle a few possible casings)
     const resIdRaw =
       reservation.RES_ID ??
       reservation.Res_ID ??
@@ -66,24 +66,24 @@ export default async function handler(req, res) {
 
     const unitAmount = Math.round(bookingFeeAmount * 100);
 
-    // ✅ TOP TITLE (left side): Charge_Type (fallback Booking Fee)
+    // Title at top of checkout
     const displayChargeType = chargeTypeRaw || "Booking Fee";
 
-    // ✅ Text below the amount: Sessions_Title | People_Text
+    // Text below amount
     const belowAmountText = [sessionsTitle, peopleText].filter(Boolean).join("  |  ").slice(0, 500);
 
-    // ✅ Shared metadata for webhook/reporting (now includes BOTH)
+    // Shared metadata
     const sharedMetadata = {
       IDKEY: String(idkey),
       RES_ID: resId || "",
-      reservation_id: String(idkey), // kept for backward compatibility with your webhook naming
+      reservation_id: String(idkey), // backward compatible
       purpose: "booking_fee",
       Charge_Type: displayChargeType,
       Sessions_Title: sessionsTitle || "",
       People_Text: peopleText || "",
     };
 
-    // ✅ Smart idempotency: changes if amount or visible text changes (and now RES_ID too)
+    // Idempotency key
     const idemKey = [
       "RES",
       String(idkey),
@@ -93,11 +93,10 @@ export default async function handler(req, res) {
       shortHash(resId || ""),
     ].join("_");
 
-    // Normalize base URL (avoid trailing slash double-slash issues)
+    // Redirect URLs
     const base = String(process.env.SITE_BASE_URL).replace(/\/+$/, "");
     const encodedIdKey = encodeURIComponent(idkey);
 
-    // ✅ Pass both IDKEY + RES_ID in the redirect URL
     const successUrl =
       `${base}/barresv5custmanage.html?idkey=${encodedIdKey}` +
       (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
@@ -106,21 +105,20 @@ export default async function handler(req, res) {
       `${base}/barresv5cancelled.html?idkey=${encodedIdKey}` +
       (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
 
-    // 2) Create Stripe Checkout Session (idempotent)
+    // 2) Create Stripe Checkout Session
     const session = await stripe.checkout.sessions.create(
       {
         mode: "payment",
 
-        // ✅ IMPORTANT: ensure a Stripe Customer is always created
-        // This makes off-session charging far more reliable later.
+        // ✅ Always create a customer so we can store a payment method for off-session
         customer_creation: "always",
 
+        // Email used to create/link customer
         customer_email: customerEmail,
 
-        // ✅ Optional: Stripe will collect PM only if needed
-        payment_method_collection: "if_required",
+        // ✅ ALWAYS collect a payment method so it is available for off-session charging later
+        payment_method_collection: "always",
 
-        // Helpful for Stripe dashboard / API recovery
         client_reference_id: String(idkey),
 
         line_items: [
@@ -137,7 +135,6 @@ export default async function handler(req, res) {
           },
         ],
 
-        // ✅ Key for future off-session charges
         payment_intent_data: {
           setup_future_usage: "off_session",
           metadata: sharedMetadata,
