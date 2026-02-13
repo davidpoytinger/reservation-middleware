@@ -30,15 +30,16 @@ function clampStr(s, max = 250) {
 
 function setCors(req, res) {
   const origin = req.headers.origin || "";
+  const allowAny = String(process.env.CORS_ALLOW_ANY || "").toLowerCase() === "true";
+
   const allowed = (process.env.ALLOWED_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // If allowlist empty, do NOT open CORS. Force you to configure it.
-  const isAllowed = allowed.includes(origin);
+  const isAllowed = allowAny || (origin && allowed.includes(origin));
 
-  if (isAllowed) {
+  if (isAllowed && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
@@ -47,26 +48,26 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  return isAllowed;
+  return { isAllowed, origin, allowAny, allowed };
 }
 
 export default async function handler(req, res) {
-  const isAllowed = setCors(req, res);
+  const cors = setCors(req, res);
 
+  // ✅ Important: preflight support
   if (req.method === "OPTIONS") {
-    // If origin not in allowlist, still return 204 but without Allow-Origin
     return res.status(204).end();
   }
 
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-  // Hard block non-allowed origins (recommended)
-  if (!isAllowed) {
+  // ✅ Hard block if not allowed (unless allow-any enabled)
+  if (!cors.isAllowed) {
     return res.status(403).json({
       ok: false,
-      error:
-        "CORS blocked. Add this request origin to ALLOWED_ORIGINS in Vercel env vars.",
-      origin: req.headers.origin || null,
+      error: "CORS blocked. Add this origin to ALLOWED_ORIGINS (or set CORS_ALLOW_ANY=true temporarily).",
+      origin: cors.origin || null,
+      allowedOriginsConfigured: cors.allowed,
     });
   }
 
@@ -86,14 +87,15 @@ export default async function handler(req, res) {
     if (!idkey) return res.status(400).json({ ok: false, error: "Missing IDKEY" });
 
     const base = num(baseAmount, null);
-    if (base === null || base <= 0) return res.status(400).json({ ok: false, error: "Invalid baseAmount" });
+    if (base === null || base <= 0) {
+      return res.status(400).json({ ok: false, error: "Invalid baseAmount" });
+    }
 
     const type = clampStr(adjustmentType || "Adjustment", 60);
     const descRaw = clampStr(description, 180);
     if (!descRaw) return res.status(400).json({ ok: false, error: "Description is required" });
 
     const formattedDescription = clampStr(`${type} – ${descRaw}`, 250);
-
     const why = clampStr(reason || "", 500);
     const who = clampStr(createdBy || "", 80);
 
@@ -110,9 +112,11 @@ export default async function handler(req, res) {
     const gratAmount = round2(base * (gratRate / 100));
     const totalAmount = round2(base + taxAmount + gratAmount);
     const totalCents = toCents(totalAmount);
-    if (!totalCents || totalCents < 50) return res.status(400).json({ ok: false, error: "Total too small" });
+    if (!totalCents || totalCents < 50) {
+      return res.status(400).json({ ok: false, error: "Total too small" });
+    }
 
-    // Load reservation by IDKEY
+    // 1) Load reservation by IDKEY
     const reservation = await getReservationByIdKey(idkey);
 
     const resId =
@@ -137,7 +141,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Insert adjustment row
+    // 2) Insert adjustment row
     const nowIso = new Date().toISOString();
 
     const adjInsert = await insertAdjustment({
@@ -163,7 +167,7 @@ export default async function handler(req, res) {
       adjInsert?.id ??
       null;
 
-    // Charge off-session
+    // 3) Charge off-session
     const idemKey = `adj_${idkey}_${adjPk || "nopk"}_${totalCents}`;
 
     let pi;
@@ -176,7 +180,9 @@ export default async function handler(req, res) {
           payment_method: stripePaymentMethodId,
           off_session: true,
           confirm: true,
+
           description: formattedDescription,
+
           metadata: {
             IDKEY: idkey,
             RES_ID: String(resId || ""),
@@ -190,6 +196,7 @@ export default async function handler(req, res) {
             grat_amount: String(round2(gratAmount)),
             total_amount: String(round2(totalAmount)),
           },
+
           expand: ["latest_charge"],
         },
         { idempotencyKey: idemKey }
@@ -242,7 +249,7 @@ export default async function handler(req, res) {
       }).catch(() => {});
     }
 
-    // Transaction insert (success)
+    // 4) Transaction insert (success)
     await insertTransactionIfMissingByRawEventId({
       IDKEY: String(idkey),
       Amount: totalAmount,
