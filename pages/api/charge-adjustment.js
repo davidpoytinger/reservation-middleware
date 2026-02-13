@@ -1,4 +1,27 @@
 // pages/api/charge-adjustment.js
+//
+// Charges a stored payment method (off-session) for a supplemental fee.
+// Writes BOTH:
+//  1) Adjustment row (insert + update by PK)
+//  2) Transaction row (idempotent insert by RawEventId)
+//
+// CORS:
+// - Handles OPTIONS preflight
+// - Supports "Origin: null" (common when embedded/iframe)
+// - Supports allow-any for debugging via CORS_ALLOW_ANY=true
+// - Strict allowlist via ALLOWED_ORIGINS (comma-separated), and you may include literal "null"
+//
+// Recommended env:
+//   STRIPE_SECRET_KEY
+//   STRIPE_WEBHOOK_SECRET (not used here, but you have it elsewhere)
+//   ALLOWED_ORIGINS="null,https://c0gfs257.caspio.com,https://pages.caspio.com,https://reservebarsandrec.com"
+//   (Optional) CORS_ALLOW_ANY="true"  // temporary debug
+//
+// NOTE: This file assumes lib/caspio exports:
+//   getReservationByIdKey
+//   insertAdjustment
+//   updateAdjustmentByPkId
+//   insertTransactionIfMissingByRawEventId
 
 import Stripe from "stripe";
 import {
@@ -28,8 +51,10 @@ function clampStr(s, max = 250) {
   return v.length > max ? v.slice(0, max) : v;
 }
 
+// CORS helper that supports "Origin: null"
 function setCors(req, res) {
-  const origin = req.headers.origin || "";
+  const originHeader = req.headers.origin; // can be undefined OR "null"
+  const origin = typeof originHeader === "string" ? originHeader : "";
   const allowAny = String(process.env.CORS_ALLOW_ANY || "").toLowerCase() === "true";
 
   const allowed = (process.env.ALLOWED_ORIGINS || "")
@@ -37,10 +62,19 @@ function setCors(req, res) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const isAllowed = allowAny || (origin && allowed.includes(origin));
+  // Decide allowed
+  const isNullOrigin = origin === "null";
+  const isAllowedStrict =
+    (origin && allowed.includes(origin)) || (isNullOrigin && allowed.includes("null"));
 
-  if (isAllowed && origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
+  const isAllowed = allowAny || isAllowedStrict;
+
+  // IMPORTANT: If allowAny, respond with "*" (works even when Origin is null/undefined).
+  // Otherwise echo back exact allowed origin, including literal "null" if configured.
+  if (allowAny) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (isAllowedStrict) {
+    res.setHeader("Access-Control-Allow-Origin", isNullOrigin ? "null" : origin);
     res.setHeader("Vary", "Origin");
   }
 
@@ -48,30 +82,37 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  return { isAllowed, origin, allowAny, allowed };
+  return { isAllowed, origin: origin || null, allowAny, allowed };
 }
 
 export default async function handler(req, res) {
   const cors = setCors(req, res);
 
-  // ✅ Important: preflight support
+  // ✅ Preflight
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
 
-  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
 
   // ✅ Hard block if not allowed (unless allow-any enabled)
   if (!cors.isAllowed) {
     return res.status(403).json({
       ok: false,
-      error: "CORS blocked. Add this origin to ALLOWED_ORIGINS (or set CORS_ALLOW_ANY=true temporarily).",
-      origin: cors.origin || null,
+      error:
+        "CORS blocked. Add this origin to ALLOWED_ORIGINS (or set CORS_ALLOW_ANY=true temporarily).",
+      origin: cors.origin,
       allowedOriginsConfigured: cors.allowed,
     });
   }
 
   try {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return res.status(500).json({ ok: false, error: "Missing STRIPE_SECRET_KEY" });
+    }
+
     const {
       IDKEY,
       baseAmount,
@@ -112,6 +153,7 @@ export default async function handler(req, res) {
     const gratAmount = round2(base * (gratRate / 100));
     const totalAmount = round2(base + taxAmount + gratAmount);
     const totalCents = toCents(totalAmount);
+
     if (!totalCents || totalCents < 50) {
       return res.status(400).json({ ok: false, error: "Total too small" });
     }
@@ -178,6 +220,8 @@ export default async function handler(req, res) {
           currency: "usd",
           customer: stripeCustomerId,
           payment_method: stripePaymentMethodId,
+
+          // Off-session charge
           off_session: true,
           confirm: true,
 
@@ -212,7 +256,7 @@ export default async function handler(req, res) {
         }).catch(() => {});
       }
 
-      // Log failed attempt
+      // Log failed attempt (idempotent key)
       const failedRawEventId = `adj_fail_${idkey}_${adjPk || "nopk"}_${totalCents}`;
       await insertTransactionIfMissingByRawEventId({
         IDKEY: String(idkey),
@@ -231,6 +275,7 @@ export default async function handler(req, res) {
         CreatedAt: new Date().toISOString(),
       }).catch(() => {});
 
+      // 402 is fine here: payment required / card declined / etc.
       return res.status(402).json({ ok: false, error: msg, adjustmentPk: adjPk });
     }
 
@@ -249,7 +294,7 @@ export default async function handler(req, res) {
       }).catch(() => {});
     }
 
-    // 4) Transaction insert (success)
+    // 4) Transaction insert (success) — idempotent by RawEventId=pi_<id>
     await insertTransactionIfMissingByRawEventId({
       IDKEY: String(idkey),
       Amount: totalAmount,
@@ -284,6 +329,10 @@ export default async function handler(req, res) {
       charge_id: latestChargeId,
       adjustmentPk: adjPk,
       idempotencyKey: idemKey,
+      cors: {
+        origin: cors.origin,
+        allowAny: cors.allowAny,
+      },
     });
   } catch (err) {
     console.error("❌ CHARGE_ADJUSTMENT_FAILED", err?.message || err);
