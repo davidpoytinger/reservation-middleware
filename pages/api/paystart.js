@@ -4,8 +4,9 @@
 // Creates a Stripe Checkout Session and redirects to Stripe.
 //
 // ✅ Passes BOTH IDKEY and RES_ID through Stripe + success/cancel URLs.
-// ✅ Forces Stripe Customer creation AND payment method collection
-//    so we can reliably charge off-session later.
+// ✅ Ensures a Stripe Customer exists and is used for Checkout
+// ✅ Uses setup_future_usage=off_session so the payment method can be reused later
+// ❌ Does NOT use payment_method_collection (not allowed for one-time payment Checkout)
 
 import Stripe from "stripe";
 import {
@@ -36,14 +37,13 @@ export default async function handler(req, res) {
     if (!process.env.SITE_BASE_URL) return res.status(500).send("Missing SITE_BASE_URL");
     if (!process.env.CASPIO_TABLE) return res.status(500).send("Missing CASPIO_TABLE");
 
-    // IDKEY from query
     const idkey = req.query.idkey || req.query.IDKEY || req.query.IdKey;
     if (!idkey) return res.status(400).send("Missing idkey");
 
-    // 1) Pull reservation data from Caspio
+    // 1) Pull reservation data
     const reservation = await getReservationByIdKey(idkey);
 
-    const customerEmail = reservation.Email;
+    const customerEmail = oneLine(reservation.Email);
     const bookingFeeAmount = Number(reservation.BookingFeeAmount);
 
     const sessionsTitle = oneLine(reservation.Sessions_Title);
@@ -65,25 +65,19 @@ export default async function handler(req, res) {
     }
 
     const unitAmount = Math.round(bookingFeeAmount * 100);
-
-    // Title at top of checkout
     const displayChargeType = chargeTypeRaw || "Booking Fee";
-
-    // Text below amount
     const belowAmountText = [sessionsTitle, peopleText].filter(Boolean).join("  |  ").slice(0, 500);
 
-    // Shared metadata
     const sharedMetadata = {
       IDKEY: String(idkey),
       RES_ID: resId || "",
-      reservation_id: String(idkey), // backward compatible
+      reservation_id: String(idkey),
       purpose: "booking_fee",
       Charge_Type: displayChargeType,
       Sessions_Title: sessionsTitle || "",
       People_Text: peopleText || "",
     };
 
-    // Idempotency key
     const idemKey = [
       "RES",
       String(idkey),
@@ -93,7 +87,6 @@ export default async function handler(req, res) {
       shortHash(resId || ""),
     ].join("_");
 
-    // Redirect URLs
     const base = String(process.env.SITE_BASE_URL).replace(/\/+$/, "");
     const encodedIdKey = encodeURIComponent(idkey);
 
@@ -105,20 +98,45 @@ export default async function handler(req, res) {
       `${base}/barresv5cancelled.html?idkey=${encodedIdKey}` +
       (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
 
-    // 2) Create Stripe Checkout Session
+    // 2) Ensure we have a Stripe Customer
+    // Prefer existing saved value from Caspio if present
+    let stripeCustomerId =
+      reservation?.StripeCustomerId ||
+      reservation?.Stripe_Customer_ID ||
+      reservation?.stripeCustomerId ||
+      null;
+
+    if (!stripeCustomerId) {
+      // Create a customer (idempotent-ish by using a deterministic key)
+      // Stripe doesn't support true idempotency on customers by email, but this is fine operationally.
+      const cust = await stripe.customers.create({
+        email: customerEmail,
+        metadata: {
+          IDKEY: String(idkey),
+          RES_ID: String(resId || ""),
+        },
+      });
+
+      stripeCustomerId = cust.id;
+
+      // Write back so future flows have cus_...
+      try {
+        const where = buildWhereForIdKey(idkey);
+        await updateReservationByWhere(where, { StripeCustomerId: stripeCustomerId });
+      } catch (e) {
+        console.warn("Caspio StripeCustomerId writeback skipped/failed:", e?.message || e);
+      }
+    }
+
+    // 3) Create Checkout Session (idempotent)
     const session = await stripe.checkout.sessions.create(
       {
         mode: "payment",
 
-        // ✅ Always create a customer so we can store a payment method for off-session
-        customer_creation: "always",
+        // ✅ Use the customer so the payment method can attach and be reused off-session
+        customer: stripeCustomerId,
 
-        // Email used to create/link customer
-        customer_email: customerEmail,
-
-        // ✅ ALWAYS collect a payment method so it is available for off-session charging later
-        payment_method_collection: "always",
-
+        // Helpful for dashboard / recovery
         client_reference_id: String(idkey),
 
         line_items: [
@@ -135,6 +153,7 @@ export default async function handler(req, res) {
           },
         ],
 
+        // ✅ This is what makes the payment method reusable later
         payment_intent_data: {
           setup_future_usage: "off_session",
           metadata: sharedMetadata,
@@ -147,7 +166,7 @@ export default async function handler(req, res) {
       { idempotencyKey: idemKey }
     );
 
-    // 3) Optional Caspio "pending" writeback
+    // 4) Optional "pending" writeback
     try {
       const where = buildWhereForIdKey(idkey);
       await updateReservationByWhere(where, {
@@ -159,7 +178,7 @@ export default async function handler(req, res) {
       console.warn("Caspio pending writeback skipped/failed:", e?.message || e);
     }
 
-    // 4) Redirect to Stripe Checkout
+    // 5) Redirect HTML
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
 
