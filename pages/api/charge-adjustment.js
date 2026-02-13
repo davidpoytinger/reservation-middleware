@@ -1,27 +1,4 @@
 // pages/api/charge-adjustment.js
-//
-// Charges a stored payment method (off-session) for a supplemental fee.
-// Writes BOTH:
-//  1) Adjustment row (insert + update by PK)
-//  2) Transaction row (idempotent insert by RawEventId)
-//
-// CORS:
-// - Handles OPTIONS preflight
-// - Supports "Origin: null" (common when embedded/iframe)
-// - Supports allow-any for debugging via CORS_ALLOW_ANY=true
-// - Strict allowlist via ALLOWED_ORIGINS (comma-separated), and you may include literal "null"
-//
-// Recommended env:
-//   STRIPE_SECRET_KEY
-//   STRIPE_WEBHOOK_SECRET (not used here, but you have it elsewhere)
-//   ALLOWED_ORIGINS="null,https://c0gfs257.caspio.com,https://pages.caspio.com,https://reservebarsandrec.com"
-//   (Optional) CORS_ALLOW_ANY="true"  // temporary debug
-//
-// NOTE: This file assumes lib/caspio exports:
-//   getReservationByIdKey
-//   insertAdjustment
-//   updateAdjustmentByPkId
-//   insertTransactionIfMissingByRawEventId
 
 import Stripe from "stripe";
 import {
@@ -29,6 +6,7 @@ import {
   insertAdjustment,
   updateAdjustmentByPkId,
   insertTransactionIfMissingByRawEventId,
+  updateReservationByWhere,
 } from "../../lib/caspio";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
@@ -51,9 +29,8 @@ function clampStr(s, max = 250) {
   return v.length > max ? v.slice(0, max) : v;
 }
 
-// CORS helper that supports "Origin: null"
 function setCors(req, res) {
-  const originHeader = req.headers.origin; // can be undefined OR "null"
+  const originHeader = req.headers.origin;
   const origin = typeof originHeader === "string" ? originHeader : "";
   const allowAny = String(process.env.CORS_ALLOW_ANY || "").toLowerCase() === "true";
 
@@ -62,15 +39,12 @@ function setCors(req, res) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // Decide allowed
   const isNullOrigin = origin === "null";
   const isAllowedStrict =
     (origin && allowed.includes(origin)) || (isNullOrigin && allowed.includes("null"));
 
   const isAllowed = allowAny || isAllowedStrict;
 
-  // IMPORTANT: If allowAny, respond with "*" (works even when Origin is null/undefined).
-  // Otherwise echo back exact allowed origin, including literal "null" if configured.
   if (allowAny) {
     res.setHeader("Access-Control-Allow-Origin", "*");
   } else if (isAllowedStrict) {
@@ -85,19 +59,95 @@ function setCors(req, res) {
   return { isAllowed, origin: origin || null, allowAny, allowed };
 }
 
+// Try to derive Stripe customer + payment method from existing Stripe IDs on the reservation.
+async function deriveStripeBillingFromReservation(reservation) {
+  // Pull from your existing columns first (support a few possible casings)
+  const existingCustomer =
+    reservation?.StripeCustomerId ||
+    reservation?.Stripe_Customer_ID ||
+    reservation?.stripeCustomerId ||
+    null;
+
+  const existingPm =
+    reservation?.StripePaymentMethodId ||
+    reservation?.Stripe_PaymentMethod_ID ||
+    reservation?.stripePaymentMethodId ||
+    null;
+
+  if (existingCustomer && existingPm) {
+    return { stripeCustomerId: existingCustomer, stripePaymentMethodId: existingPm, source: "reservation" };
+  }
+
+  // If missing, try PaymentIntent ID first (best)
+  const piId =
+    reservation?.StripePaymentIntentId ||
+    reservation?.Stripe_PaymentIntent_ID ||
+    reservation?.stripePaymentIntentId ||
+    null;
+
+  if (piId) {
+    const pi = await stripe.paymentIntents.retrieve(String(piId), {
+      expand: ["payment_method", "latest_charge"],
+    });
+
+    const stripeCustomerId =
+      (typeof pi.customer === "string" ? pi.customer : pi.customer?.id) || existingCustomer || null;
+
+    const pmFromPI =
+      (typeof pi.payment_method === "string" && pi.payment_method) ||
+      (typeof pi.payment_method !== "string" ? pi.payment_method?.id : null) ||
+      null;
+
+    const pmFromCharge =
+      (typeof pi.latest_charge === "string" ? null : pi.latest_charge?.payment_method) || null;
+
+    const stripePaymentMethodId = pmFromPI || pmFromCharge || existingPm || null;
+
+    return { stripeCustomerId, stripePaymentMethodId, source: "payment_intent", pi };
+  }
+
+  // Next best: checkout session -> payment_intent
+  const csId =
+    reservation?.StripeCheckoutSessionId ||
+    reservation?.Stripe_CheckoutSession_ID ||
+    reservation?.stripeCheckoutSessionId ||
+    null;
+
+  if (csId) {
+    const cs = await stripe.checkout.sessions.retrieve(String(csId), { expand: ["payment_intent"] });
+    const piMaybe = cs.payment_intent;
+
+    if (piMaybe) {
+      const piId2 = typeof piMaybe === "string" ? piMaybe : piMaybe.id;
+      const pi = await stripe.paymentIntents.retrieve(String(piId2), {
+        expand: ["payment_method", "latest_charge"],
+      });
+
+      const stripeCustomerId =
+        (typeof pi.customer === "string" ? pi.customer : pi.customer?.id) || existingCustomer || null;
+
+      const pmFromPI =
+        (typeof pi.payment_method === "string" && pi.payment_method) ||
+        (typeof pi.payment_method !== "string" ? pi.payment_method?.id : null) ||
+        null;
+
+      const pmFromCharge =
+        (typeof pi.latest_charge === "string" ? null : pi.latest_charge?.payment_method) || null;
+
+      const stripePaymentMethodId = pmFromPI || pmFromCharge || existingPm || null;
+
+      return { stripeCustomerId, stripePaymentMethodId, source: "checkout_session", pi };
+    }
+  }
+
+  return { stripeCustomerId: existingCustomer, stripePaymentMethodId: existingPm, source: "none" };
+}
+
 export default async function handler(req, res) {
   const cors = setCors(req, res);
 
-  // ✅ Preflight
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
-  }
-
-  // ✅ Hard block if not allowed (unless allow-any enabled)
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
   if (!cors.isAllowed) {
     return res.status(403).json({
       ok: false,
@@ -121,7 +171,6 @@ export default async function handler(req, res) {
       adjustmentType,
       description,
       reason,
-      createdBy,
     } = req.body || {};
 
     const idkey = oneLine(IDKEY);
@@ -138,7 +187,6 @@ export default async function handler(req, res) {
 
     const formattedDescription = clampStr(`${type} – ${descRaw}`, 250);
     const why = clampStr(reason || "", 500);
-    const who = clampStr(createdBy || "", 80);
 
     const taxRate = num(taxPct, null);
     const gratRate = num(gratPct, null);
@@ -170,17 +218,42 @@ export default async function handler(req, res) {
           ""
       ) || null;
 
-    const stripeCustomerId =
-      reservation?.StripeCustomerId || reservation?.Stripe_Customer_ID || null;
-
-    const stripePaymentMethodId =
-      reservation?.StripePaymentMethodId || reservation?.Stripe_PaymentMethod_ID || null;
+    // ✅ Derive StripeCustomerId + StripePaymentMethodId (fallback to PI/CS)
+    const derived = await deriveStripeBillingFromReservation(reservation);
+    const stripeCustomerId = derived.stripeCustomerId;
+    const stripePaymentMethodId = derived.stripePaymentMethodId;
 
     if (!stripeCustomerId || !stripePaymentMethodId) {
       return res.status(409).json({
         ok: false,
-        error: "Reservation missing StripeCustomerId or StripePaymentMethodId",
+        error: "Reservation missing StripeCustomerId or StripePaymentMethodId (and could not derive from PaymentIntent/CheckoutSession).",
+        debug: {
+          sourceTried: derived.source,
+          hasStripePaymentIntentId: !!(
+            reservation?.StripePaymentIntentId ||
+            reservation?.Stripe_PaymentIntent_ID ||
+            reservation?.stripePaymentIntentId
+          ),
+          hasStripeCheckoutSessionId: !!(
+            reservation?.StripeCheckoutSessionId ||
+            reservation?.Stripe_CheckoutSession_ID ||
+            reservation?.stripeCheckoutSessionId
+          ),
+        },
       });
+    }
+
+    // ✅ Write-back (optional but strongly recommended)
+    // Only attempt if you have these columns. If you don't, Caspio will throw ColumnNotFound.
+    try {
+      const where = `IDKEY='${String(idkey).replaceAll("'", "''")}'`;
+      await updateReservationByWhere(where, {
+        StripeCustomerId: stripeCustomerId,
+        StripePaymentMethodId: stripePaymentMethodId,
+      });
+    } catch (e) {
+      // Non-blocking: if columns don't exist, charging still works.
+      console.warn("⚠️ Stripe billing writeback skipped/failed:", e?.message || e);
     }
 
     // 2) Insert adjustment row
@@ -199,7 +272,6 @@ export default async function handler(req, res) {
       Grat_Pct: round2(gratRate),
       Grat_Amount: gratAmount,
       Status: "Pending",
-      Created_By: who,
       Created_Date: nowIso,
     });
 
@@ -220,13 +292,9 @@ export default async function handler(req, res) {
           currency: "usd",
           customer: stripeCustomerId,
           payment_method: stripePaymentMethodId,
-
-          // Off-session charge
           off_session: true,
           confirm: true,
-
           description: formattedDescription,
-
           metadata: {
             IDKEY: idkey,
             RES_ID: String(resId || ""),
@@ -240,7 +308,6 @@ export default async function handler(req, res) {
             grat_amount: String(round2(gratAmount)),
             total_amount: String(round2(totalAmount)),
           },
-
           expand: ["latest_charge"],
         },
         { idempotencyKey: idemKey }
@@ -256,7 +323,6 @@ export default async function handler(req, res) {
         }).catch(() => {});
       }
 
-      // Log failed attempt (idempotent key)
       const failedRawEventId = `adj_fail_${idkey}_${adjPk || "nopk"}_${totalCents}`;
       await insertTransactionIfMissingByRawEventId({
         IDKEY: String(idkey),
@@ -275,7 +341,6 @@ export default async function handler(req, res) {
         CreatedAt: new Date().toISOString(),
       }).catch(() => {});
 
-      // 402 is fine here: payment required / card declined / etc.
       return res.status(402).json({ ok: false, error: msg, adjustmentPk: adjPk });
     }
 
@@ -294,7 +359,6 @@ export default async function handler(req, res) {
       }).catch(() => {});
     }
 
-    // 4) Transaction insert (success) — idempotent by RawEventId=pi_<id>
     await insertTransactionIfMissingByRawEventId({
       IDKEY: String(idkey),
       Amount: totalAmount,
@@ -329,10 +393,7 @@ export default async function handler(req, res) {
       charge_id: latestChargeId,
       adjustmentPk: adjPk,
       idempotencyKey: idemKey,
-      cors: {
-        origin: cors.origin,
-        allowAny: cors.allowAny,
-      },
+      derivedStripeBillingSource: derived.source,
     });
   } catch (err) {
     console.error("❌ CHARGE_ADJUSTMENT_FAILED", err?.message || err);
