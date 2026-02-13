@@ -262,19 +262,15 @@ function showSuccessAndClose() {
   overlay.appendChild(box);
   document.body.appendChild(overlay);
 
+  // ✅ Tell parent to close modal + reload
   setTimeout(() => {
     try {
-      // If inside iframe → reload parent
-      if (window.parent && window.parent !== window) {
-        window.parent.location.reload();
-      } else {
-        // If standalone page
-        window.location.reload();
-      }
-    } catch (e) {
-      window.location.reload();
-    }
-  }, 1000);
+      window.parent.postMessage({ type: "BAR_CHARGE_DONE" }, "*");
+    } catch (e) {}
+
+    // Optional: stop user seeing the form again while parent reloads
+    try { document.body.innerHTML = ""; } catch (e) {}
+  }, 900);
 }
 
   chargeBtn.addEventListener("click", async () => {
