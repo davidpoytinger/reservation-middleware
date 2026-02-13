@@ -235,7 +235,7 @@
 
   compute();
 
- function showSuccessAndClose() {
+function showSuccessAndClose() {
   const overlay = document.createElement("div");
   overlay.style.position = "fixed";
   overlay.style.inset = "0";
@@ -256,42 +256,27 @@
   box.innerHTML = `
     <div style="font-size:36px;">✅</div>
     <div style="font-weight:900; margin-top:6px;">Charge Successful</div>
-    <div id="closingText" style="font-size:13px; opacity:.7; margin-top:4px;">Closing…</div>
-    <button id="manualCloseBtn"
-      style="display:none;margin-top:12px;padding:10px 14px;border-radius:10px;border:0;background:#111;color:#fff;font-weight:900;cursor:pointer;">
-      Close
-    </button>
+    <div style="font-size:13px; opacity:.7; margin-top:4px;">Refreshing page…</div>
   `;
 
   overlay.appendChild(box);
   document.body.appendChild(overlay);
 
-  // Tell parent to close the modal
-  try {
-    window.parent.postMessage({ type: "BAR_CHARGE_CLOSE" }, "*");
-  } catch (e) {}
-
-  // Try to close window (only works if opened via window.open)
   setTimeout(() => {
-    try { window.close(); } catch (e) {}
-
-    // If we're still here (iframe case), show a manual close button as fallback
-    const btn = document.getElementById("manualCloseBtn");
-    const txt = document.getElementById("closingText");
-    if (txt) txt.textContent = "If this window didn't close, click Close.";
-    if (btn) {
-      btn.style.display = "inline-block";
-      btn.addEventListener("click", () => {
-        // one more attempt to tell parent to close
-        try {
-          window.parent.postMessage({ type: "BAR_CHARGE_CLOSE" }, "*");
-        } catch(e) {}
-        // and remove the success overlay so user isn’t stuck
-        try { overlay.remove(); } catch(e) {}
-      }, { once: true });
+    try {
+      // If inside iframe → reload parent
+      if (window.parent && window.parent !== window) {
+        window.parent.location.reload();
+      } else {
+        // If standalone page
+        window.location.reload();
+      }
+    } catch (e) {
+      window.location.reload();
     }
-  }, 900);
+  }, 1000);
 }
+
   chargeBtn.addEventListener("click", async () => {
     if (!IDKEY) return show("bad", "Missing IDKEY in URL.");
 
