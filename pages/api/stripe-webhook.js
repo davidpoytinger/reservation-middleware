@@ -24,29 +24,25 @@ function escapeWhereValue(v) {
 
 /**
  * If Caspio responds with ColumnNotFound, drop those fields and retry once.
- * This makes the webhook robust while you roll out new columns like StripePaymentMethodId.
+ * This keeps the webhook robust if a column name mismatch happens later.
  */
 async function updateReservationResilient(where, payload) {
   try {
     return await updateReservationByWhere(where, payload);
   } catch (err) {
     const msg = String(err?.message || "");
-    const m = msg.match(/field\(s\) do not exist:\s*'([^']+)'(?:,\s*'([^']+)')*/i);
 
-    // If we can’t parse, just rethrow
-    if (!/ColumnNotFound/i.test(msg) && !m) throw err;
+    if (!/ColumnNotFound/i.test(msg) && !/do not exist/i.test(msg)) throw err;
 
-    // Try to extract all quoted field names after "do not exist:"
-    const missing = [];
     const after = msg.split("do not exist:")[1] || "";
-    for (const match of after.matchAll(/'([^']+)'/g)) missing.push(match[1]);
+    const missing = [];
+    for (const m of after.matchAll(/'([^']+)'/g)) missing.push(m[1]);
 
     if (!missing.length) throw err;
 
     const trimmed = { ...payload };
     for (const f of missing) delete trimmed[f];
 
-    // If removing fields leaves nothing meaningful, skip retry
     if (Object.keys(trimmed).length === 0) throw err;
 
     console.warn("⚠️ Caspio ColumnNotFound. Retrying without fields:", missing);
@@ -68,14 +64,14 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // Only handle the event we care about right now
+  // Only handle this event for now (keeps behavior identical to your current webhook)
   if (event.type !== "checkout.session.completed") {
     return res.status(200).json({ received: true });
   }
 
   const session = event.data.object;
 
-  // ✅ Accept BOTH your new metadata and legacy
+  // ✅ Accept BOTH new metadata and legacy metadata key
   const idkey =
     session?.metadata?.IDKEY ||
     session?.metadata?.reservation_id ||
@@ -84,13 +80,12 @@ export default async function handler(req, res) {
 
   if (!idkey) return res.status(200).json({ received: true });
 
-  // Optional
+  // ✅ Pull metadata sent from paystart/create-checkout-session
   const metaChargeType = session?.metadata?.Charge_Type || null;
   const metaSessionsTitle = session?.metadata?.Sessions_Title || null;
   const metaPeopleText = session?.metadata?.People_Text || null;
 
   try {
-    // Expand customer + payment_intent
     const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
       expand: ["customer", "payment_intent"],
     });
@@ -102,7 +97,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // --- Derive card details for your existing fields
     const charge = paymentIntent?.charges?.data?.[0];
 
     const card =
@@ -125,7 +119,7 @@ export default async function handler(req, res) {
 
     const paidAtIso = new Date(paidAtUnix * 1000).toISOString();
 
-    // --- NEW: stored-payment identifiers for off-session charging
+    // ✅ Stored-payment identifiers for future off-session charging
     const stripeCustomerId =
       typeof fullSession.customer === "string"
         ? fullSession.customer
@@ -156,12 +150,9 @@ export default async function handler(req, res) {
       StripeCheckoutSessionId: fullSession.id,
       StripePaymentIntentId: paymentIntent?.id || null,
 
-      // Existing field name you already write:
       StripeCustomerId: stripeCustomerId,
 
-      // ✅ NEW (for off-session charging)
-      // IMPORTANT: you must have a matching column in Caspio.
-      // If you name it differently, change the key below.
+      // ✅ This is the key new field you confirmed exists:
       StripePaymentMethodId: stripePaymentMethodId,
 
       Payment_processor: "Stripe",
@@ -178,12 +169,12 @@ export default async function handler(req, res) {
       Transaction_date: paidAtIso,
     };
 
-    // Preserve your metadata overwrites
+    // Keep your metadata behavior
     if (metaChargeType) payload.Charge_Type = metaChargeType;
     if (metaSessionsTitle) payload.Sessions_Title = metaSessionsTitle;
     if (metaPeopleText) payload.People_Text = metaPeopleText;
 
-    // Apply view-derived email branding fields (existing behavior)
+    // Keep your view-based overlays
     if (viewRow) {
       if (viewRow.BAR2_Email_Design_Email_Content) {
         const maxLen = 64000;
@@ -208,15 +199,14 @@ export default async function handler(req, res) {
       payload.Primary_Color_2 =
         viewRow.GEN_Business_Units_Primary_Color_2 || null;
 
-      payload.Facility =
-        viewRow.GEN_Business_Units_Facility || null;
+      payload.Facility = viewRow.GEN_Business_Units_Facility || null;
     }
 
-    // ✅ Resilient update: retries without missing columns if needed
+    // Robust update (future-proof)
     await updateReservationResilient(where, payload);
 
     // -----------------------------------------
-    // TRANSACTION INSERT (idempotent)
+    // TRANSACTION INSERT (exactly like before)
     // -----------------------------------------
     let reservationChargeType = metaChargeType;
     if (!reservationChargeType) {
@@ -235,10 +225,6 @@ export default async function handler(req, res) {
       StripeChargeId: charge?.id || null,
       StripeCustomerId: stripeCustomerId,
 
-      // NOTE: only add this if you ALSO created the column in SIGMA_BAR3_Transactions.
-      // Leaving it OUT keeps this 100% backward compatible with your current schema.
-      // StripePaymentMethodId: stripePaymentMethodId,
-
       Charge_Type: reservationChargeType,
       Description: reservationChargeType,
 
@@ -254,6 +240,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error("❌ WEBHOOK_FAILED", err?.message);
+    // Keep your current behavior: return 200 so Stripe doesn't retry endlessly
     return res.status(200).json({ received: true });
   }
 }
