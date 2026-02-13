@@ -235,46 +235,63 @@
 
   compute();
 
-  function showSuccessAndClose() {
-    // Overlay
-    const overlay = document.createElement("div");
-    overlay.style.position = "fixed";
-    overlay.style.inset = "0";
-    overlay.style.background = "rgba(0,0,0,0.35)";
-    overlay.style.display = "flex";
-    overlay.style.alignItems = "center";
-    overlay.style.justifyContent = "center";
-    overlay.style.zIndex = "99999";
+ function showSuccessAndClose() {
+  const overlay = document.createElement("div");
+  overlay.style.position = "fixed";
+  overlay.style.inset = "0";
+  overlay.style.background = "rgba(0,0,0,0.35)";
+  overlay.style.display = "flex";
+  overlay.style.alignItems = "center";
+  overlay.style.justifyContent = "center";
+  overlay.style.zIndex = "99999";
 
-    const box = document.createElement("div");
-    box.style.background = "#fff";
-    box.style.borderRadius = "14px";
-    box.style.padding = "20px 24px";
-    box.style.boxShadow = "0 10px 30px rgba(0,0,0,0.2)";
-    box.style.textAlign = "center";
-    box.innerHTML = `
-      <div style="font-size:36px;">✅</div>
-      <div style="font-weight:900; margin-top:6px;">Charge Successful</div>
-      <div style="font-size:13px; opacity:.7; margin-top:4px;">Closing…</div>
-    `;
+  const box = document.createElement("div");
+  box.style.background = "#fff";
+  box.style.borderRadius = "14px";
+  box.style.padding = "20px 24px";
+  box.style.boxShadow = "0 10px 30px rgba(0,0,0,0.2)";
+  box.style.textAlign = "center";
+  box.style.minWidth = "260px";
 
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
+  box.innerHTML = `
+    <div style="font-size:36px;">✅</div>
+    <div style="font-weight:900; margin-top:6px;">Charge Successful</div>
+    <div id="closingText" style="font-size:13px; opacity:.7; margin-top:4px;">Closing…</div>
+    <button id="manualCloseBtn"
+      style="display:none;margin-top:12px;padding:10px 14px;border-radius:10px;border:0;background:#111;color:#fff;font-weight:900;cursor:pointer;">
+      Close
+    </button>
+  `;
 
-    // Tell parent (if iframe)
-    try {
-      window.parent.postMessage({ type: "BAR_CHARGE_SUCCESS" }, "*");
-    } catch(e){}
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
 
-    // Close after short delay
-    setTimeout(() => {
-      try { window.close(); } catch(e){}
-      try {
-        window.parent.postMessage({ type: "BAR_CHARGE_CLOSE" }, "*");
-      } catch(e){}
-    }, 900);
-  }
+  // Tell parent to close the modal
+  try {
+    window.parent.postMessage({ type: "BAR_CHARGE_CLOSE" }, "*");
+  } catch (e) {}
 
+  // Try to close window (only works if opened via window.open)
+  setTimeout(() => {
+    try { window.close(); } catch (e) {}
+
+    // If we're still here (iframe case), show a manual close button as fallback
+    const btn = document.getElementById("manualCloseBtn");
+    const txt = document.getElementById("closingText");
+    if (txt) txt.textContent = "If this window didn't close, click Close.";
+    if (btn) {
+      btn.style.display = "inline-block";
+      btn.addEventListener("click", () => {
+        // one more attempt to tell parent to close
+        try {
+          window.parent.postMessage({ type: "BAR_CHARGE_CLOSE" }, "*");
+        } catch(e) {}
+        // and remove the success overlay so user isn’t stuck
+        try { overlay.remove(); } catch(e) {}
+      }, { once: true });
+    }
+  }, 900);
+}
   chargeBtn.addEventListener("click", async () => {
     if (!IDKEY) return show("bad", "Missing IDKEY in URL.");
 
