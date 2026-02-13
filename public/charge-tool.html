@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Charge Tool</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 16px; background:#fff; color:#111; }
+    h2 { margin: 0 0 10px; }
+    .muted { opacity:.8; margin-bottom: 14px; font-size: 13px; }
+    label { display:block; font-weight:800; margin: 10px 0 6px; font-size: 13px; }
+    input, select, textarea { width: 100%; padding: 10px; border:1px solid #ccc; border-radius: 10px; font-size: 14px; }
+    textarea { min-height: 70px; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .btn { margin-top: 14px; padding:12px 14px; border-radius: 12px; border:0; background:#111; color:#fff; font-weight:900; cursor:pointer; }
+    .status { margin-top: 12px; white-space: pre-wrap; font-size: 13px; }
+    @media (max-width: 700px){ .row{ grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+
+<h2>Charge Supplemental Fee</h2>
+<div class="muted" id="idkeyMsg"></div>
+
+<div class="row">
+  <div>
+    <label>Base Charge ($)</label>
+    <input id="base" type="number" step="0.01" />
+  </div>
+  <div>
+    <label>Adjustment Type</label>
+    <select id="type">
+      <option>Manual Charge</option>
+      <option>Late Cancel</option>
+      <option>No Show</option>
+      <option>Added People</option>
+      <option>Minimum Spend Shortfall</option>
+      <option>Damage Fee</option>
+    </select>
+  </div>
+</div>
+
+<label>Description (required)</label>
+<input id="desc" />
+
+<div class="row">
+  <div>
+    <label>Tax %</label>
+    <input id="tax" type="number" step="0.01" value="6.1" />
+  </div>
+  <div>
+    <label>Auto Grat %</label>
+    <input id="grat" type="number" step="0.01" value="15" />
+  </div>
+</div>
+
+<label>Internal Notes</label>
+<textarea id="reason"></textarea>
+
+<label>Created By</label>
+<input id="by" />
+
+<button class="btn" id="chargeBtn">Confirm Charge</button>
+
+<div class="status" id="status"></div>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const IDKEY = params.get("IDKEY") || params.get("idkey");
+  const statusEl = document.getElementById("status");
+
+  document.getElementById("idkeyMsg").textContent =
+    IDKEY ? ("IDKEY: " + IDKEY) : "⚠ Missing IDKEY in URL (add ?IDKEY=XXXX)";
+
+  function show(msg){ statusEl.textContent = msg; }
+
+  document.getElementById("chargeBtn").addEventListener("click", async () => {
+    if(!IDKEY) return show("Missing IDKEY in URL.");
+
+    const payload = {
+      IDKEY,
+      baseAmount: Number(document.getElementById("base").value || 0),
+      taxPct: Number(document.getElementById("tax").value || 6.1),
+      gratPct: Number(document.getElementById("grat").value || 15),
+      adjustmentType: document.getElementById("type").value,
+      description: (document.getElementById("desc").value || "").trim(),
+      reason: document.getElementById("reason").value,
+      createdBy: document.getElementById("by").value
+    };
+
+    if(!payload.description) return show("Description is required.");
+    if(!payload.baseAmount || payload.baseAmount <= 0) return show("Base must be > 0.");
+
+    show("Charging…");
+
+    try {
+      // ✅ SAME-ORIGIN call (no CORS)
+      const resp = await fetch("/api/charge-adjustment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const json = await resp.json().catch(() => ({}));
+      show(JSON.stringify(json, null, 2));
+    } catch (e) {
+      show("Failed: " + (e?.message || e));
+    }
+  });
+</script>
+
+</body>
+</html>
