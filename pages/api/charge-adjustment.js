@@ -1,4 +1,5 @@
 // pages/api/charge-adjustment.js
+
 import Stripe from "stripe";
 import {
   getReservationByIdKey,
@@ -27,8 +28,47 @@ function clampStr(s, max = 250) {
   return v.length > max ? v.slice(0, max) : v;
 }
 
+function setCors(req, res) {
+  const origin = req.headers.origin || "";
+  const allowed = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // If allowlist empty, do NOT open CORS. Force you to configure it.
+  const isAllowed = allowed.includes(origin);
+
+  if (isAllowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  return isAllowed;
+}
+
 export default async function handler(req, res) {
+  const isAllowed = setCors(req, res);
+
+  if (req.method === "OPTIONS") {
+    // If origin not in allowlist, still return 204 but without Allow-Origin
+    return res.status(204).end();
+  }
+
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // Hard block non-allowed origins (recommended)
+  if (!isAllowed) {
+    return res.status(403).json({
+      ok: false,
+      error:
+        "CORS blocked. Add this request origin to ALLOWED_ORIGINS in Vercel env vars.",
+      origin: req.headers.origin || null,
+    });
+  }
 
   try {
     const {
@@ -43,14 +83,14 @@ export default async function handler(req, res) {
     } = req.body || {};
 
     const idkey = oneLine(IDKEY);
-    if (!idkey) return res.status(400).json({ error: "Missing IDKEY" });
+    if (!idkey) return res.status(400).json({ ok: false, error: "Missing IDKEY" });
 
     const base = num(baseAmount, null);
-    if (base === null || base <= 0) return res.status(400).json({ error: "Invalid baseAmount" });
+    if (base === null || base <= 0) return res.status(400).json({ ok: false, error: "Invalid baseAmount" });
 
     const type = clampStr(adjustmentType || "Adjustment", 60);
     const descRaw = clampStr(description, 180);
-    if (!descRaw) return res.status(400).json({ error: "Description is required" });
+    if (!descRaw) return res.status(400).json({ ok: false, error: "Description is required" });
 
     const formattedDescription = clampStr(`${type} – ${descRaw}`, 250);
 
@@ -60,19 +100,19 @@ export default async function handler(req, res) {
     const taxRate = num(taxPct, null);
     const gratRate = num(gratPct, null);
     if (taxRate === null || taxRate < 0 || taxRate > 25) {
-      return res.status(400).json({ error: "Invalid taxPct (expected 0–25)" });
+      return res.status(400).json({ ok: false, error: "Invalid taxPct (expected 0–25)" });
     }
     if (gratRate === null || gratRate < 0 || gratRate > 50) {
-      return res.status(400).json({ error: "Invalid gratPct (expected 0–50)" });
+      return res.status(400).json({ ok: false, error: "Invalid gratPct (expected 0–50)" });
     }
 
     const taxAmount = round2(base * (taxRate / 100));
     const gratAmount = round2(base * (gratRate / 100));
     const totalAmount = round2(base + taxAmount + gratAmount);
     const totalCents = toCents(totalAmount);
-    if (!totalCents || totalCents < 50) return res.status(400).json({ error: "Total too small" });
+    if (!totalCents || totalCents < 50) return res.status(400).json({ ok: false, error: "Total too small" });
 
-    // 1) Load reservation by IDKEY
+    // Load reservation by IDKEY
     const reservation = await getReservationByIdKey(idkey);
 
     const resId =
@@ -92,11 +132,12 @@ export default async function handler(req, res) {
 
     if (!stripeCustomerId || !stripePaymentMethodId) {
       return res.status(409).json({
+        ok: false,
         error: "Reservation missing StripeCustomerId or StripePaymentMethodId",
       });
     }
 
-    // 2) Insert adjustment row (audit)
+    // Insert adjustment row
     const nowIso = new Date().toISOString();
 
     const adjInsert = await insertAdjustment({
@@ -122,7 +163,7 @@ export default async function handler(req, res) {
       adjInsert?.id ??
       null;
 
-    // 3) Charge off-session (idempotent)
+    // Charge off-session
     const idemKey = `adj_${idkey}_${adjPk || "nopk"}_${totalCents}`;
 
     let pi;
@@ -135,10 +176,7 @@ export default async function handler(req, res) {
           payment_method: stripePaymentMethodId,
           off_session: true,
           confirm: true,
-
-          // This shows up in Stripe dashboard
           description: formattedDescription,
-
           metadata: {
             IDKEY: idkey,
             RES_ID: String(resId || ""),
@@ -152,25 +190,22 @@ export default async function handler(req, res) {
             grat_amount: String(round2(gratAmount)),
             total_amount: String(round2(totalAmount)),
           },
-
           expand: ["latest_charge"],
         },
         { idempotencyKey: idemKey }
       );
     } catch (err) {
       const msg = err?.raw?.message || err?.message || "Stripe error";
-      const code = err?.raw?.code || err?.code || null;
-      const decline = err?.raw?.decline_code || null;
 
       if (adjPk) {
         await updateAdjustmentByPkId(adjPk, {
           Status: "Failed",
-          Stripe_Error: `${msg}${code ? ` (${code})` : ""}${decline ? ` [${decline}]` : ""}`,
+          Stripe_Error: msg,
           Updated_At: new Date().toISOString(),
         }).catch(() => {});
       }
 
-      // Log failed attempt in transaction table (still IDKEY-based)
+      // Log failed attempt
       const failedRawEventId = `adj_fail_${idkey}_${adjPk || "nopk"}_${totalCents}`;
       await insertTransactionIfMissingByRawEventId({
         IDKEY: String(idkey),
@@ -182,22 +217,14 @@ export default async function handler(req, res) {
         StripePaymentIntentId: null,
         StripeChargeId: null,
         StripeCustomerId: String(stripeCustomerId),
-
         Charge_Type: type,
         Description: formattedDescription,
-
         RawEventId: failedRawEventId,
         Transaction_date: new Date().toISOString(),
         CreatedAt: new Date().toISOString(),
       }).catch(() => {});
 
-      return res.status(402).json({
-        ok: false,
-        error: msg,
-        code,
-        decline_code: decline,
-        adjustmentPk: adjPk,
-      });
+      return res.status(402).json({ ok: false, error: msg, adjustmentPk: adjPk });
     }
 
     const piStatus = pi?.status || "unknown";
@@ -215,8 +242,7 @@ export default async function handler(req, res) {
       }).catch(() => {});
     }
 
-    // 4) Insert transaction row (success path)
-    const txnRawEventId = `pi_${pi.id}`;
+    // Transaction insert (success)
     await insertTransactionIfMissingByRawEventId({
       IDKEY: String(idkey),
       Amount: totalAmount,
@@ -227,11 +253,9 @@ export default async function handler(req, res) {
       StripePaymentIntentId: pi.id,
       StripeChargeId: latestChargeId,
       StripeCustomerId: String(stripeCustomerId),
-
       Charge_Type: type,
       Description: formattedDescription,
-
-      RawEventId: txnRawEventId,
+      RawEventId: `pi_${pi.id}`,
       Transaction_date: new Date().toISOString(),
       CreatedAt: new Date().toISOString(),
     }).catch(() => {});
