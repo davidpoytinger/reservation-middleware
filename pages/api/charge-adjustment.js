@@ -1,10 +1,15 @@
 // pages/api/charge-adjustment.js
+//
+// Charges a customer a supplemental fee.
+// - If we have stored Stripe customer + payment method -> off-session charge (one-click)
+// - Otherwise -> creates a Stripe Checkout Session and returns checkout_url
+//
+// Writes to Caspio: SIGMA_BAR3_Transactions (via insertTransactionIfMissingByRawEventId).
+// NO "adjustments" table required.
 
 import Stripe from "stripe";
 import {
   getReservationByIdKey,
-  insertAdjustment,
-  updateAdjustmentByPkId,
   insertTransactionIfMissingByRawEventId,
   updateReservationByWhere,
 } from "../../lib/caspio";
@@ -59,7 +64,9 @@ function setCors(req, res) {
   return { isAllowed, origin: origin || null, allowAny, allowed };
 }
 
-// Try to derive Stripe customer + payment method from existing Stripe IDs on the reservation.
+// Pull Customer/PM from reservation; attempt derive from PI if present.
+// NOTE: If you don’t store StripePaymentMethodId yet, the “derive” step may still fail,
+// in which case we fall back to Checkout.
 async function deriveStripeBillingFromReservation(reservation) {
   const existingCustomer =
     reservation?.StripeCustomerId ||
@@ -74,11 +81,7 @@ async function deriveStripeBillingFromReservation(reservation) {
     null;
 
   if (existingCustomer && existingPm) {
-    return {
-      stripeCustomerId: existingCustomer,
-      stripePaymentMethodId: existingPm,
-      source: "reservation",
-    };
+    return { stripeCustomerId: existingCustomer, stripePaymentMethodId: existingPm, source: "reservation" };
   }
 
   const piId =
@@ -106,39 +109,6 @@ async function deriveStripeBillingFromReservation(reservation) {
     const stripePaymentMethodId = pmFromPI || pmFromCharge || existingPm || null;
 
     return { stripeCustomerId, stripePaymentMethodId, source: "payment_intent" };
-  }
-
-  const csId =
-    reservation?.StripeCheckoutSessionId ||
-    reservation?.Stripe_CheckoutSession_ID ||
-    reservation?.stripeCheckoutSessionId ||
-    null;
-
-  if (csId) {
-    const cs = await stripe.checkout.sessions.retrieve(String(csId), { expand: ["payment_intent"] });
-    const piMaybe = cs.payment_intent;
-
-    if (piMaybe) {
-      const piId2 = typeof piMaybe === "string" ? piMaybe : piMaybe.id;
-      const pi = await stripe.paymentIntents.retrieve(String(piId2), {
-        expand: ["payment_method", "latest_charge"],
-      });
-
-      const stripeCustomerId =
-        (typeof pi.customer === "string" ? pi.customer : pi.customer?.id) || existingCustomer || null;
-
-      const pmFromPI =
-        (typeof pi.payment_method === "string" && pi.payment_method) ||
-        (typeof pi.payment_method !== "string" ? pi.payment_method?.id : null) ||
-        null;
-
-      const pmFromCharge =
-        (typeof pi.latest_charge === "string" ? null : pi.latest_charge?.payment_method) || null;
-
-      const stripePaymentMethodId = pmFromPI || pmFromCharge || existingPm || null;
-
-      return { stripeCustomerId, stripePaymentMethodId, source: "checkout_session" };
-    }
   }
 
   return { stripeCustomerId: existingCustomer, stripePaymentMethodId: existingPm, source: "none" };
@@ -185,7 +155,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Invalid baseAmount" });
     }
 
-    const type = clampStr(adjustmentType || "Adjustment", 60);
+    const type = clampStr(adjustmentType || "Supplemental Fee", 60);
     const descRaw = clampStr(description, 180);
     if (!descRaw) return res.status(400).json({ ok: false, error: "Description is required" });
 
@@ -210,7 +180,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Total too small" });
     }
 
-    // 1) Load reservation by IDKEY
+    // Load reservation
     const reservation = await getReservationByIdKey(idkey);
 
     const resId =
@@ -224,38 +194,14 @@ export default async function handler(req, res) {
 
     const customerEmail = oneLine(reservation?.Email || "") || null;
 
-    // 2) Insert adjustment row (always)
-    const nowIso = new Date().toISOString();
-    const adjInsert = await insertAdjustment({
-      RES_ID: resId,
-      IDKEY: idkey,
-      Adjustment_Type: type,
-      Description: formattedDescription,
-      Adjustment_Reason: why,
-      Amount: totalAmount,
-      Base_Amount: base,
-      Tax_Pct: round2(taxRate),
-      Tax_Amount: taxAmount,
-      Grat_Pct: round2(gratRate),
-      Grat_Amount: gratAmount,
-      Status: "Pending",
-      Created_Date: nowIso,
-    });
-
-    const adjPk =
-      adjInsert?.Result?.[0]?.PK_ID ??
-      adjInsert?.PK_ID ??
-      adjInsert?.id ??
-      null;
-
-    // 3) Try off-session first
+    // Try to derive stored billing
     const derived = await deriveStripeBillingFromReservation(reservation);
     const stripeCustomerId = derived.stripeCustomerId;
     const stripePaymentMethodId = derived.stripePaymentMethodId;
 
-    // If we found both, do one-click off-session charge
+    // If we *can* off-session charge -> do it
     if (stripeCustomerId && stripePaymentMethodId) {
-      // write-back (non-blocking)
+      // Optional writeback to reservation for future speed
       try {
         const where = `IDKEY='${String(idkey).replaceAll("'", "''")}'`;
         await updateReservationByWhere(where, {
@@ -266,7 +212,7 @@ export default async function handler(req, res) {
         console.warn("⚠️ Stripe billing writeback skipped/failed:", e?.message || e);
       }
 
-      const idemKey = `adj_${idkey}_${adjPk || "nopk"}_${totalCents}`;
+      const idemKey = `supp_${idkey}_${totalCents}_${Date.now()}`; // unique per click; you can make it deterministic if you prefer
 
       let pi;
       try {
@@ -280,11 +226,12 @@ export default async function handler(req, res) {
             confirm: true,
             description: formattedDescription,
             metadata: {
-              IDKEY: idkey,
+              IDKEY: String(idkey),
               RES_ID: String(resId || ""),
-              adjustment_pk: String(adjPk || ""),
-              adjustment_type: type,
-              description: formattedDescription,
+              purpose: "supplemental_fee",
+              Charge_Type: type,
+              Description: formattedDescription,
+              Reason: why,
               base_amount: String(round2(base)),
               tax_pct: String(round2(taxRate)),
               tax_amount: String(round2(taxAmount)),
@@ -300,15 +247,7 @@ export default async function handler(req, res) {
       } catch (err) {
         const msg = err?.raw?.message || err?.message || "Stripe error";
 
-        if (adjPk) {
-          await updateAdjustmentByPkId(adjPk, {
-            Status: "Failed",
-            Stripe_Error: msg,
-            Updated_At: new Date().toISOString(),
-          }).catch(() => {});
-        }
-
-        const failedRawEventId = `adj_fail_${idkey}_${adjPk || "nopk"}_${totalCents}`;
+        // Log failure to transactions table (best-effort)
         await insertTransactionIfMissingByRawEventId({
           IDKEY: String(idkey),
           Amount: totalAmount,
@@ -321,29 +260,19 @@ export default async function handler(req, res) {
           StripeCustomerId: String(stripeCustomerId),
           Charge_Type: type,
           Description: formattedDescription,
-          RawEventId: failedRawEventId,
+          RawEventId: `supp_fail_${idkey}_${totalCents}_${Date.now()}`,
           Transaction_date: new Date().toISOString(),
           CreatedAt: new Date().toISOString(),
         }).catch(() => {});
 
-        return res.status(402).json({ ok: false, error: msg, adjustmentPk: adjPk });
+        return res.status(402).json({ ok: false, error: msg });
       }
 
       const piStatus = pi?.status || "unknown";
       const latestChargeId =
         (typeof pi?.latest_charge === "string" ? pi.latest_charge : pi?.latest_charge?.id) || null;
 
-      if (adjPk) {
-        await updateAdjustmentByPkId(adjPk, {
-          Status: piStatus === "succeeded" ? "Charged" : "Pending",
-          Stripe_PaymentIntent_ID: pi.id,
-          Stripe_Charge_ID: latestChargeId,
-          Stripe_Error: "",
-          Charged_At: piStatus === "succeeded" ? new Date().toISOString() : null,
-          Updated_At: new Date().toISOString(),
-        }).catch(() => {});
-      }
-
+      // Log success to transactions table (best-effort)
       await insertTransactionIfMissingByRawEventId({
         IDKEY: String(idkey),
         Amount: totalAmount,
@@ -378,11 +307,10 @@ export default async function handler(req, res) {
         },
         payment_intent: { id: pi.id, status: piStatus },
         charge_id: latestChargeId,
-        adjustmentPk: adjPk,
       });
     }
 
-    // 4) FALLBACK: Create a Checkout session for the customer to pay
+    // Otherwise fallback: create a Checkout session (customer pays)
     const baseUrl = String(process.env.SITE_BASE_URL).replace(/\/+$/, "");
     const successUrl =
       `${baseUrl}/barresv5custmanage.html?idkey=${encodeURIComponent(idkey)}` +
@@ -395,9 +323,9 @@ export default async function handler(req, res) {
       IDKEY: String(idkey),
       RES_ID: String(resId || ""),
       purpose: "supplemental_fee",
-      adjustment_pk: String(adjPk || ""),
-      adjustment_type: type,
-      description: formattedDescription,
+      Charge_Type: type,
+      Description: formattedDescription,
+      Reason: why,
       base_amount: String(round2(base)),
       tax_pct: String(round2(taxRate)),
       tax_amount: String(round2(taxAmount)),
@@ -409,15 +337,8 @@ export default async function handler(req, res) {
 
     const checkoutSession = await stripe.checkout.sessions.create({
       mode: "payment",
-
-      // Create customer if possible, but don’t rely on it
-      customer_creation: "always",
       ...(customerEmail ? { customer_email: customerEmail } : {}),
-
-      payment_method_collection: "always",
-
       client_reference_id: String(idkey),
-
       line_items: [
         {
           quantity: 1,
@@ -431,27 +352,16 @@ export default async function handler(req, res) {
           },
         },
       ],
-
       payment_intent_data: {
         setup_future_usage: "off_session",
         metadata: checkoutMeta,
       },
       metadata: checkoutMeta,
-
       success_url: successUrl,
       cancel_url: cancelUrl,
     });
 
-    // Update adjustment row with checkout id (non-blocking)
-    if (adjPk) {
-      await updateAdjustmentByPkId(adjPk, {
-        Status: "AwaitingPayment",
-        StripeCheckoutSessionId: checkoutSession.id,
-        Updated_At: new Date().toISOString(),
-      }).catch(() => {});
-    }
-
-    // Transaction row for "created" (idempotent)
+    // Log "checkout created" to transactions (best-effort)
     await insertTransactionIfMissingByRawEventId({
       IDKEY: String(idkey),
       Amount: totalAmount,
@@ -475,7 +385,6 @@ export default async function handler(req, res) {
       idkey,
       res_id: resId,
       description: formattedDescription,
-      adjustmentPk: adjPk,
       checkout_session_id: checkoutSession.id,
       checkout_url: checkoutSession.url,
       breakdown: {
