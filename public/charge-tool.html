@@ -183,7 +183,7 @@
     </div>
   </div>
 
-  <script>
+<script>
   const params = new URLSearchParams(location.search);
   const IDKEY = (params.get("IDKEY") || params.get("idkey") || "").trim();
 
@@ -223,9 +223,8 @@
     return { base, taxPct, gratPct };
   }
 
-  ["base", "tax", "grat"].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.addEventListener("input", compute);
+  ["base","tax","grat"].forEach(id => {
+    document.getElementById(id).addEventListener("input", compute);
   });
 
   if (IDKEY) {
@@ -236,22 +235,47 @@
 
   compute();
 
-  function openCheckout(url) {
-    // Try to open a new tab/window. If blocked, show a clickable link.
-    const w = window.open(url, "_blank", "noopener,noreferrer");
-    if (!w) {
-      // Popup blocked – provide a link
-      statusEl.className = "status warn";
-      statusEl.style.display = "block";
-      statusEl.innerHTML =
-        "Popup blocked by browser. Click to open Stripe Checkout:\n\n" +
-        `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
-    }
+  function showSuccessAndClose() {
+    // Overlay
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.background = "rgba(0,0,0,0.35)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.zIndex = "99999";
+
+    const box = document.createElement("div");
+    box.style.background = "#fff";
+    box.style.borderRadius = "14px";
+    box.style.padding = "20px 24px";
+    box.style.boxShadow = "0 10px 30px rgba(0,0,0,0.2)";
+    box.style.textAlign = "center";
+    box.innerHTML = `
+      <div style="font-size:36px;">✅</div>
+      <div style="font-weight:900; margin-top:6px;">Charge Successful</div>
+      <div style="font-size:13px; opacity:.7; margin-top:4px;">Closing…</div>
+    `;
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    // Tell parent (if iframe)
+    try {
+      window.parent.postMessage({ type: "BAR_CHARGE_SUCCESS" }, "*");
+    } catch(e){}
+
+    // Close after short delay
+    setTimeout(() => {
+      try { window.close(); } catch(e){}
+      try {
+        window.parent.postMessage({ type: "BAR_CHARGE_CLOSE" }, "*");
+      } catch(e){}
+    }, 900);
   }
 
   chargeBtn.addEventListener("click", async () => {
-    if (chargeBtn.disabled) return;
-
     if (!IDKEY) return show("bad", "Missing IDKEY in URL.");
 
     const description = (document.getElementById("desc").value || "").trim();
@@ -284,24 +308,19 @@
 
       if (!resp.ok || !json.ok) {
         show("bad", JSON.stringify(json, null, 2) || "Charge failed.");
+        chargeBtn.disabled = false;
         return;
       }
 
-      // ✅ If off-session succeeded
-      if (json.mode === "off_session") {
-        show("ok", "CHARGED SUCCESSFULLY\n\n" + JSON.stringify(json, null, 2));
+      // Off-session success
+      if (json.mode === "off_session" && json.payment_intent?.status === "succeeded") {
+        showSuccessAndClose();
         return;
       }
 
-      // ✅ If fallback checkout created
-      if (json.mode === "checkout" && json.checkout_url) {
-        show("ok", "CHECKOUT LINK CREATED\n\nOpening Stripe Checkout…");
-        openCheckout(json.checkout_url);
-        return;
-      }
-
-      // Fallback: show JSON
+      // Fallback display
       show("ok", "SUCCESS\n\n" + JSON.stringify(json, null, 2));
+
     } catch (e) {
       show("bad", "Failed: " + (e?.message || String(e)));
     } finally {
