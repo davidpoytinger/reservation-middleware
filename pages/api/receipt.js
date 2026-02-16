@@ -1,16 +1,16 @@
 // pages/api/receipt.js
 //
-// Customer receipt -> /api/receipt?txn_id=123
-// Includes CORS so it can be called from reservebarsandrec.com (Weebly).
+// Weebly -> /api/receipt?txn_id=...
+// Looks up a transaction by TXN_ID (stored as text in Caspio).
+// Includes CORS for reservebarsandrec.com.
 
-import { findOneByWhere } from "../../lib/caspio";
+import { findOneByWhere, escapeWhereValue } from "../../lib/caspio";
 
 function setCors(req, res) {
   const allowed = [
     "https://reservebarsandrec.com",
     "https://www.reservebarsandrec.com",
   ];
-
   const origin = req.headers.origin;
   const allowOrigin = allowed.includes(origin) ? origin : allowed[0];
 
@@ -27,14 +27,17 @@ export default async function handler(req, res) {
   if (req.method !== "GET") return res.status(405).send("Method not allowed");
 
   try {
-    const txnId = req.query.txn_id || req.query.TXN_ID;
+    const txnIdRaw = req.query.txn_id || req.query.TXN_ID || req.query.txnid || "";
+    const txnId = String(txnIdRaw).trim();
+
     if (!txnId) return res.status(400).send("Missing txn_id");
 
-    const n = Number(txnId);
-    if (!Number.isFinite(n)) return res.status(400).send("Invalid txn_id");
-
+    // IMPORTANT:
+    // TXN_ID is NVARCHAR in Caspio (error proves this), so ALWAYS quote it.
     const table = process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions";
-    const row = await findOneByWhere(table, `TXN_ID=${n}`);
+    const where = `TXN_ID='${escapeWhereValue(txnId)}'`;
+
+    const row = await findOneByWhere(table, where);
     if (!row) return res.status(404).send("Transaction not found");
 
     res.setHeader("Cache-Control", "no-store");
