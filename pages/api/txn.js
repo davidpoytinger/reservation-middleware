@@ -1,7 +1,7 @@
 // pages/api/txns.js
 //
 // Weebly -> /api/txns?idkey=...
-// Returns transaction history for the given IDKEY
+// Returns transaction history for the given IDKEY.
 
 import { listTransactionsByIdKey } from "../../lib/caspio";
 
@@ -12,9 +12,9 @@ export default async function handler(req, res) {
     const idkey = req.query.idkey || req.query.IDKEY;
     if (!idkey) return res.status(400).send("Missing idkey");
 
-    const txns = await listTransactionsByIdKey(String(idkey));
+    const txns = await listTransactionsByIdKey(String(idkey), 500);
 
-    // Sort newest first (prefer Transaction_date then CreatedAt)
+    // newest first
     txns.sort((a, b) => {
       const da = Date.parse(a.Transaction_date || a.CreatedAt || "") || 0;
       const db = Date.parse(b.Transaction_date || b.CreatedAt || "") || 0;
