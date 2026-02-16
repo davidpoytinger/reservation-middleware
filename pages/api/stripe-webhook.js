@@ -47,16 +47,21 @@ async function updateReservationResilient(where, payload) {
 }
 
 function getIdKeyFromMetadata(meta) {
-  return (
-    meta?.IDKEY ||
-    meta?.reservation_id ||
-    meta?.idkey ||
-    null
-  );
+  return meta?.IDKEY || meta?.reservation_id || meta?.idkey || null;
 }
 
 function dollarsFromCents(cents) {
   return typeof cents === "number" ? Number((cents / 100).toFixed(2)) : null;
+}
+
+// Safely read Confirmation_Number from reservation row
+function getConfirmationNumberFromReservationRow(row) {
+  return (
+    row?.Confirmation_Number ||
+    row?.ConfirmationNumber ||
+    row?.CONFIRMATION_NUMBER ||
+    null
+  );
 }
 
 export default async function handler(req, res) {
@@ -74,6 +79,15 @@ export default async function handler(req, res) {
   }
 
   try {
+    // We'll cache reservation row per webhook execution (if we ever look it up)
+    let reservationCache = null;
+    async function getReservationCached(idkey) {
+      if (reservationCache && reservationCache.IDKEY === idkey) return reservationCache;
+      const row = await getReservationByIdKey(idkey).catch(() => null);
+      reservationCache = row ? { ...row, IDKEY: idkey } : { IDKEY: idkey };
+      return row;
+    }
+
     // ------------------------------------------------------------
     // 1) CHECKOUT COMPLETED (your existing behavior + txn fields)
     // ------------------------------------------------------------
@@ -106,7 +120,9 @@ export default async function handler(req, res) {
           ? paymentIntent?.payment_method?.card
           : null);
 
-      const amountDollars = dollarsFromCents(paymentIntent?.amount_received ?? paymentIntent?.amount ?? null);
+      const amountDollars = dollarsFromCents(
+        paymentIntent?.amount_received ?? paymentIntent?.amount ?? null
+      );
       const currency = paymentIntent?.currency?.toLowerCase() || "usd";
 
       const paidAtUnix =
@@ -193,10 +209,13 @@ export default async function handler(req, res) {
 
       await updateReservationResilient(where, payload);
 
-      // TRANSACTION INSERT (now includes TxnType + PM)
+      // ✅ Pull reservation once for Charge_Type fallback + Confirmation_Number
+      const reservationRow = await getReservationCached(idkey);
+      const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
+
+      // TRANSACTION INSERT (now includes TxnType + PM + Confirmation_Number)
       let reservationChargeType = metaChargeType;
       if (!reservationChargeType) {
-        const reservationRow = await getReservationByIdKey(idkey).catch(() => null);
         reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
       }
 
@@ -220,6 +239,9 @@ export default async function handler(req, res) {
 
         Charge_Type: reservationChargeType,
         Description: reservationChargeType,
+
+        // ✅ NEW FIELD
+        Confirmation_Number: confirmationNumber,
 
         RawEventId: String(event.id),
         Transaction_date: paidAtIso,
@@ -266,6 +288,10 @@ export default async function handler(req, res) {
       const chargeType = piFull?.metadata?.Charge_Type || "supplemental_charge";
       const description = piFull?.metadata?.Description || chargeType;
 
+      // ✅ Pull reservation for Confirmation_Number (and optionally fallback Charge_Type)
+      const reservationRow = await getReservationCached(idkey);
+      const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
+
       const txnPayload = {
         IDKEY: String(idkey),
 
@@ -286,6 +312,9 @@ export default async function handler(req, res) {
 
         Charge_Type: chargeType,
         Description: description,
+
+        // ✅ NEW FIELD
+        Confirmation_Number: confirmationNumber,
 
         RawEventId: String(event.id),
         Transaction_date: createdIso,
@@ -328,6 +357,10 @@ export default async function handler(req, res) {
       const chargeType = pi?.metadata?.Charge_Type || "refund";
       const description = `Refund - ${chargeType}`;
 
+      // ✅ Pull reservation for Confirmation_Number
+      const reservationRow = await getReservationCached(idkey);
+      const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
+
       const txnPayload = {
         IDKEY: String(idkey),
 
@@ -351,6 +384,9 @@ export default async function handler(req, res) {
 
         Charge_Type: chargeType,
         Description: description,
+
+        // ✅ NEW FIELD
+        Confirmation_Number: confirmationNumber,
 
         RawEventId: String(event.id),
         Transaction_date: createdIso,
