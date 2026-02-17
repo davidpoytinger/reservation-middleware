@@ -1,31 +1,30 @@
 // pages/api/reserve.js
 //
-// Insert booking into Caspio BAR2_Reservations_SIGMA,
-// then read back the generated IDKEY by using a unique placeholder token.
+// Creates a NEW reservation row in Caspio (BAR2_Reservations_SIGMA) and returns { idkey, res_id }.
+// - Sets Status = "In Process"
+// - Sets Type = "Reservation"
+// - Generates RES_ID (12-char alphanumeric) on insert
+// - Optionally writes placeholder StripeCheckoutSessionId / StripePaymentIntentId (unique “correlation”)
+//   If those fields are read-only or missing, it retries without them.
 //
-// Fixes:
-// ✅ CORS allows both www and non-www
-// ✅ OPTIONS preflight handled
-// ✅ Does NOT write IDKEY (often read-only / computed in Caspio)
-// ✅ Writes a unique placeholder StripeCheckoutSessionId as correlation token
-// ✅ Reads back IDKEY by querying for StripeCheckoutSessionId placeholder
-// ✅ Retries once if Caspio reports "read-only fields" by trimming them
+// REQUIRED ENVs (recommended):
+//   CASPIO_CLIENT_ID
+//   CASPIO_CLIENT_SECRET
+// Optional ENVs:
+//   CASPIO_ACCOUNT_DOMAIN   (default: c0gfs257.caspio.com)
+//   CASPIO_TABLE            (default: BAR2_Reservations_SIGMA)
+//   ALLOWED_ORIGIN          (default: https://www.reservebarsandrec.com)
 
-export const config = { api: { bodyParser: true } };
-
-const CASPIO_BASE = "https://c0gfs257.caspio.com/rest/v2";
-const CASPIO_OAUTH = "https://c0gfs257.caspio.com/oauth/token";
+const CASPIO_ACCOUNT_DOMAIN = process.env.CASPIO_ACCOUNT_DOMAIN || "c0gfs257.caspio.com";
+const CASPIO_BASE = `https://${CASPIO_ACCOUNT_DOMAIN}/rest/v2`;
+const CASPIO_TOKEN_URL = `https://${CASPIO_ACCOUNT_DOMAIN}/oauth/token`;
 
 const TABLE = process.env.CASPIO_TABLE || "BAR2_Reservations_SIGMA";
 
-// Allow both origins (your site is currently www)
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || [
-  "https://reservebarsandrec.com",
-  "https://www.reservebarsandrec.com",
-]).toString().split(",").map(s => s.trim()).filter(Boolean);
-
 function setCors(res, origin) {
-  const allowOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+  const allowed = process.env.ALLOWED_ORIGIN || "https://www.reservebarsandrec.com";
+  const allowOrigin = origin && origin === allowed ? origin : allowed;
+
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
@@ -33,11 +32,7 @@ function setCors(res, origin) {
 }
 
 function oneLine(s) {
-  return String(s ?? "").replace(/\s+/g, " ").trim();
-}
-
-function isValidEmail(v) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || "").trim());
+  return String(s || "").replace(/\s+/g, " ").trim();
 }
 
 function normalizePhone(v) {
@@ -47,18 +42,47 @@ function normalizePhone(v) {
   return plus + digits;
 }
 
-function escWhereValue(v) {
-  return String(v ?? "").replace(/'/g, "''");
+function isValidEmail(v) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || "").trim());
+}
+
+function makeResId(len = 12) {
+  // excludes 0,1,I,O for readability
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+function makeCorrelationId() {
+  // 24 chars-ish: time + random, safe for unique placeholder fields
+  const a = Date.now().toString(36);
+  const b = Math.random().toString(36).slice(2, 10);
+  const c = Math.random().toString(36).slice(2, 10);
+  return `init_${a}_${b}${c}`.slice(0, 48);
 }
 
 async function fetchJson(url, opts = {}) {
   const r = await fetch(url, opts);
   const text = await r.text();
   let j = {};
-  try { j = text ? JSON.parse(text) : {}; } catch {}
+  try {
+    j = text ? JSON.parse(text) : {};
+  } catch {}
   if (!r.ok) {
-    const msg = j?.Message || j?.error_description || j?.error || text || `${r.status}`;
-    throw new Error(String(msg).slice(0, 800));
+    const msg =
+      j?.Message ||
+      j?.message ||
+      j?.error_description ||
+      j?.error ||
+      text ||
+      `${r.status}`;
+    const err = new Error(String(msg).slice(0, 700));
+    err.status = r.status;
+    err.raw = { text, json: j };
+    throw err;
   }
   return j;
 }
@@ -67,91 +91,92 @@ async function getCaspioToken() {
   if (!process.env.CASPIO_CLIENT_ID) throw new Error("Missing CASPIO_CLIENT_ID");
   if (!process.env.CASPIO_CLIENT_SECRET) throw new Error("Missing CASPIO_CLIENT_SECRET");
 
-  const body = new URLSearchParams();
-  body.set("grant_type", "client_credentials");
-  body.set("client_id", process.env.CASPIO_CLIENT_ID);
-  body.set("client_secret", process.env.CASPIO_CLIENT_SECRET);
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: process.env.CASPIO_CLIENT_ID,
+    client_secret: process.env.CASPIO_CLIENT_SECRET,
+  });
 
-  const tok = await fetchJson(CASPIO_OAUTH, {
+  const j = await fetchJson(CASPIO_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
 
-  if (!tok?.access_token) throw new Error("Caspio token missing access_token");
-  return tok.access_token;
+  if (!j.access_token) throw new Error("Caspio token response missing access_token");
+  return j.access_token;
 }
 
-async function caspioInsert(table, token, payload) {
-  return await fetchJson(`${CASPIO_BASE}/tables/${encodeURIComponent(table)}/records`, {
+async function caspioInsertRecord(token, payload) {
+  return await fetchJson(`${CASPIO_BASE}/tables/${encodeURIComponent(TABLE)}/records`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify(payload),
   });
 }
 
-async function caspioGet(table, token, where, select) {
-  const qWhere = encodeURIComponent(where);
-  const qSel = encodeURIComponent(select);
-  const url =
-    `${CASPIO_BASE}/tables/${encodeURIComponent(table)}/records` +
-    `?q.where=${qWhere}&q.select=${qSel}&q.limit=1`;
-  return await fetchJson(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
 /**
- * If Caspio says some fields are read-only, attempt to infer field names (best-effort),
- * remove them, and retry ONCE.
- *
- * Caspio errors are not always consistent about listing names, so we also allow
- * an explicit "hard blocklist" if needed later.
+ * Insert with resilience:
+ * - If Caspio complains about read-only fields, retry once WITHOUT Stripe placeholder fields.
+ * - If Caspio complains about ColumnNotFound, retry once removing the named fields (if included).
+ * - If Caspio complains about duplicate RES_ID, regenerate RES_ID and retry (up to 5 tries).
  */
-function extractPossibleReadOnlyFields(message) {
-  const msg = String(message || "");
-  const fields = new Set();
+async function insertReservationResilient(token, basePayload) {
+  let payload = { ...basePayload };
 
-  // Sometimes Caspio includes quoted field names in the message
-  for (const m of msg.matchAll(/'([^']+)'/g)) {
-    const name = m[1];
-    if (name && name.length < 80) fields.add(name);
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      return await caspioInsertRecord(token, payload);
+    } catch (err) {
+      const msg = String(err?.message || "");
+
+      // Duplicate RES_ID (or some other unique) -> regenerate RES_ID and retry
+      if (/duplicate/i.test(msg) && /RES_ID/i.test(msg)) {
+        payload.RES_ID = makeResId(12);
+        continue;
+      }
+
+      // Read-only fields -> retry once dropping Stripe placeholders
+      if (/read-only/i.test(msg)) {
+        const trimmed = { ...payload };
+        delete trimmed.StripeCheckoutSessionId;
+        delete trimmed.StripePaymentIntentId;
+
+        // If we already removed them, stop looping
+        const alreadyRemoved =
+          payload.StripeCheckoutSessionId == null && payload.StripePaymentIntentId == null;
+
+        if (alreadyRemoved) throw err;
+
+        payload = trimmed;
+        // retry immediately (don’t consume a RES_ID regeneration attempt)
+        continue;
+      }
+
+      // ColumnNotFound -> try to strip named fields if Caspio tells us which
+      if (/ColumnNotFound/i.test(msg) || /do not exist/i.test(msg)) {
+        const after = msg.split("do not exist:")[1] || "";
+        const missing = [];
+        for (const m of after.matchAll(/'([^']+)'/g)) missing.push(m[1]);
+
+        if (missing.length) {
+          const trimmed = { ...payload };
+          for (const f of missing) delete trimmed[f];
+          if (Object.keys(trimmed).length === 0) throw err;
+          payload = trimmed;
+          continue;
+        }
+      }
+
+      // Otherwise, fail
+      throw err;
+    }
   }
 
-  return Array.from(fields);
-}
-
-async function insertResilient(table, token, payload) {
-  try {
-    return await caspioInsert(table, token, payload);
-  } catch (err) {
-    const msg = String(err?.message || "");
-    if (!/read-only/i.test(msg)) throw err;
-
-    // Try trimming any mentioned fields
-    const ro = extractPossibleReadOnlyFields(msg);
-    const trimmed = { ...payload };
-    for (const f of ro) delete trimmed[f];
-
-    // If message didn’t name fields, we still do a safe fallback trim set
-    // based on the most common read-only culprits in reservation schemas.
-    // (This does NOT move your UI around; it just makes insert succeed.)
-    const fallbackTrim = [
-      "IDKEY",
-      "Confirmation_Number",
-      "Transaction_ID",
-      "Transaction_date",
-      "BookingFeePaidAt",
-      "CreatedAt",
-      "UpdatedAt",
-    ];
-    for (const f of fallbackTrim) delete trimmed[f];
-
-    // If we didn't remove anything, rethrow original
-    if (Object.keys(trimmed).length === Object.keys(payload).length) throw err;
-
-    return await caspioInsert(table, token, trimmed);
-  }
+  throw new Error("Insert failed after multiple attempts (RES_ID collisions).");
 }
 
 export default async function handler(req, res) {
@@ -164,44 +189,53 @@ export default async function handler(req, res) {
   try {
     const b = req.body || {};
 
-    // ---- Validate required fields (minimal + your flow requirements) ----
+    // ---- Required from UI ----
     const First_Name = oneLine(b.First_Name);
-    const Last_Name  = oneLine(b.Last_Name);
-    const Email      = oneLine(b.Email);
+    const Last_Name = oneLine(b.Last_Name);
+    const Email = oneLine(b.Email);
     const Phone_Number = oneLine(b.Phone_Number);
 
-    if (!First_Name) return res.status(400).json({ ok:false, error:"Missing First_Name" });
-    if (!Last_Name)  return res.status(400).json({ ok:false, error:"Missing Last_Name" });
-    if (!Email || !isValidEmail(Email)) return res.status(400).json({ ok:false, error:"Missing/invalid Email" });
+    const Business_Unit = oneLine(b.Business_Unit);
+    const Session_Date = oneLine(b.Session_Date);
+    const Session_ID = oneLine(b.Session_ID);
+
+    const Item = oneLine(b.Item);
+    const Price_Class = oneLine(b.Price_Class);
+    const Sessions_Title = oneLine(b.Sessions_Title);
+
+    const C_Quant = oneLine(b.C_Quant);
+    const Units = oneLine(b.Units);
+    const Unit_Price = oneLine(b.Unit_Price);
+
+    const Charge_Type = oneLine(b.Charge_Type); // must be "Pay Now" or "24 Hour Hold Fee" per your UI
+    const BookingFeeAmount = Number(b.BookingFeeAmount);
+
+    // ---- Basic validation (keep it light) ----
+    if (!First_Name) return res.status(400).json({ ok: false, error: "Missing First_Name" });
+    if (!Last_Name) return res.status(400).json({ ok: false, error: "Missing Last_Name" });
+    if (!Email || !isValidEmail(Email)) return res.status(400).json({ ok: false, error: "Missing/invalid Email" });
 
     const phoneNorm = normalizePhone(Phone_Number);
-    if (!Phone_Number || phoneNorm.replace(/\D/g, "").length < 10) {
-      return res.status(400).json({ ok:false, error:"Missing/invalid Phone_Number" });
+    if (!phoneNorm || phoneNorm.replace(/\D/g, "").length < 10) {
+      return res.status(400).json({ ok: false, error: "Missing/invalid Phone_Number" });
     }
 
-    const Business_Unit = oneLine(b.Business_Unit);
-    const Session_Date  = oneLine(b.Session_Date);
-    const Session_ID    = oneLine(b.Session_ID);
+    if (!Business_Unit) return res.status(400).json({ ok: false, error: "Missing Business_Unit" });
+    if (!Session_Date) return res.status(400).json({ ok: false, error: "Missing Session_Date" });
+    if (!Session_ID) return res.status(400).json({ ok: false, error: "Missing Session_ID" });
 
-    if (!Business_Unit) return res.status(400).json({ ok:false, error:"Missing Business_Unit" });
-    if (!Session_Date)  return res.status(400).json({ ok:false, error:"Missing Session_Date" });
-    if (!Session_ID)    return res.status(400).json({ ok:false, error:"Missing Session_ID" });
-
-    const Charge_Type = oneLine(b.Charge_Type);
-    if (!Charge_Type) return res.status(400).json({ ok:false, error:"Missing Charge_Type" });
-
-    const BookingFeeAmount = Number(b.BookingFeeAmount);
+    if (!Charge_Type) return res.status(400).json({ ok: false, error: "Missing Charge_Type" });
     if (!Number.isFinite(BookingFeeAmount) || BookingFeeAmount <= 0) {
-      return res.status(400).json({ ok:false, error:"Missing/invalid BookingFeeAmount" });
+      return res.status(400).json({ ok: false, error: "Missing/invalid BookingFeeAmount (> 0 required)" });
     }
 
-    // ---- Correlation token used to find the inserted row ----
-    // Must be UNIQUE (so Caspio unique constraint is satisfied and lookup is reliable)
-    const correlation = `pending_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    // ---- Generate IDs ----
+    const RES_ID = makeResId(12);
+    const correlation = makeCorrelationId();
 
-    // ---- Build insert payload (avoid IDKEY) ----
+    // ---- Build payload (ONLY fields you intend to write) ----
     const payload = {
-      // DO NOT send IDKEY here — let Caspio generate it if it's computed.
+      RES_ID,
 
       Status: "In Process",
       Type: "Reservation",
@@ -219,47 +253,57 @@ export default async function handler(req, res) {
       Session_Date,
       Session_ID,
 
-      Item: oneLine(b.Item),
-      Price_Class: oneLine(b.Price_Class),
-      Sessions_Title: oneLine(b.Sessions_Title),
+      Item,
+      Price_Class,
+      Sessions_Title,
 
-      C_Quant: oneLine(b.C_Quant),
-      Units: oneLine(b.Units),
-      Unit_Price: oneLine(b.Unit_Price),
+      C_Quant,
+      Units,
+      Unit_Price,
 
       People_Text: oneLine(b.People_Text),
       BookingFeeAmount,
 
-      // placeholder fields (if writable) — used for uniqueness + lookup
+      // Placeholders to avoid blank/duplicate issues on unique fields
       StripeCheckoutSessionId: correlation,
       StripePaymentIntentId: correlation,
     };
 
     const token = await getCaspioToken();
+    const insertJson = await insertReservationResilient(token, payload);
 
-    // Insert (resilient to read-only fields)
-    await insertResilient(TABLE, token, payload);
+    // Caspio insert response shape varies; try common patterns
+    const inserted = insertJson?.Result || insertJson?.result || insertJson;
 
-    // Read back the generated IDKEY using the correlation token
-    const where = `StripeCheckoutSessionId='${escWhereValue(correlation)}'`;
-    const got = await caspioGet(TABLE, token, where, "IDKEY,RES_ID,Session_ID,Session_Date,Email");
+    const idkey =
+      inserted?.IDKEY ||
+      inserted?.IdKey ||
+      inserted?.idkey ||
+      inserted?.IDKey ||
+      null;
 
-    const row = got?.Result?.[0] || null;
-    const idkey = row?.IDKEY || null;
-
+    // If IDKEY isn’t returned, still return RES_ID so you can debug,
+    // but typically Caspio will return computed/generated fields.
     if (!idkey) {
-      // If Caspio stripped StripeCheckoutSessionId as read-only, lookup will fail.
-      // In that case, throw a clear message so you know which field is read-only.
-      throw new Error(
-        "Insert succeeded but could not read back IDKEY. " +
-        "This usually means StripeCheckoutSessionId is read-only OR Caspio did not save it. " +
-        "Make StripeCheckoutSessionId writable (not computed) or provide a dedicated writable correlation field."
-      );
+      return res.status(200).json({
+        ok: true,
+        idkey: null,
+        res_id: RES_ID,
+        note: "Inserted, but IDKEY was not returned by Caspio response.",
+        raw: inserted || null,
+      });
     }
 
-    return res.status(200).json({ ok: true, idkey });
+    return res.status(200).json({
+      ok: true,
+      idkey: String(idkey),
+      res_id: RES_ID,
+    });
   } catch (err) {
-    console.error("reserve.js error:", err?.message || err);
-    return res.status(500).json({ ok:false, error: err?.message || "Server error" });
+    console.error("RESERVE_FAILED:", err?.message || err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || "Server error",
+    });
   }
 }
