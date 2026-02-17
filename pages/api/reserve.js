@@ -1,29 +1,50 @@
 // pages/api/reserve.js
 //
-// Receives reservation fields from your Weebly booking UI,
-// inserts into Caspio BAR2_Reservations_SIGMA,
-// returns { ok:true, idkey:"..." } so the front-end can redirect to /api/paystart?idkey=...
+// Creates a new reservation row in Caspio (BAR2_Reservations_SIGMA).
+// Called by your front-end booking UI.
+// Flow: UI -> POST /api/reserve -> returns {idkey} -> redirect to /api/paystart?idkey=...
 //
-// ✅ Handles Caspio "read-only" errors by retrying with smaller payloads (allowlist).
-// ✅ Includes CORS for reservebarsandrec.com
-// ✅ Uses /api/caspio-token to obtain Caspio access token (server-side)
+// Key behaviors:
+// ✅ Status forced to "In Process"
+// ✅ Type forced to "Reservation"
+// ✅ DOES NOT set StripeCheckoutSessionId / StripePaymentIntentId (avoids unique/blank issues)
+// ✅ CORS for reservebarsandrec.com
+// ✅ Resilient retry if Caspio says ColumnNotFound or read-only fields
+
+export const config = { api: { bodyParser: { sizeLimit: "1mb" } } };
 
 function setCors(res, origin) {
-  const allowedList = String(
-    process.env.ALLOWED_ORIGINS || "https://reservebarsandrec.com"
-  )
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const allowOrigin = allowedList.includes(origin) ? origin : allowedList[0];
+  const allowed = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
+  const allowOrigin = origin && origin === allowed ? origin : allowed;
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
+function oneLine(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function safeString(s, max = 255) {
+  const v = String(s ?? "").trim();
+  return v.length > max ? v.slice(0, max) : v;
+}
+
+function safeNumber(n) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : null;
+}
+
+function caspioAccountBase() {
+  // Prefer explicit CASPIO_BASE, else build from CASPIO_ACCOUNT
+  const base =
+    process.env.CASPIO_BASE ||
+    (process.env.CASPIO_ACCOUNT ? `https://${process.env.CASPIO_ACCOUNT}.caspio.com` : "");
+  if (!base) throw new Error("Missing CASPIO_BASE or CASPIO_ACCOUNT env var.");
+  return base.replace(/\/+$/, "");
+}
 
 async function fetchJson(url, opts = {}) {
   const r = await fetch(url, opts);
@@ -32,141 +53,189 @@ async function fetchJson(url, opts = {}) {
   try {
     j = text ? JSON.parse(text) : {};
   } catch {
-    // ignore
+    // non-json error
   }
   if (!r.ok) {
-    const msg =
-      j?.Message ||
-      j?.error_description ||
-      j?.error ||
-      text ||
-      `${r.status}`;
-    throw new Error(String(msg).slice(0, 500));
+    const msg = j?.Message || j?.error_description || j?.error || text || `${r.status}`;
+    throw new Error(String(msg).slice(0, 800));
   }
   return j;
 }
 
-function pick(obj, keys) {
-  const out = {};
-  for (const k of keys) {
-    if (Object.prototype.hasOwnProperty.call(obj, k)) out[k] = obj[k];
+async function getCaspioToken() {
+  const clientId = process.env.CASPIO_CLIENT_ID;
+  const clientSecret = process.env.CASPIO_CLIENT_SECRET;
+  if (!clientId) throw new Error("Missing CASPIO_CLIENT_ID");
+  if (!clientSecret) throw new Error("Missing CASPIO_CLIENT_SECRET");
+
+  const base = caspioAccountBase();
+  const tokenUrl = `${base}/oauth/token`;
+
+  // Caspio OAuth client_credentials
+  const form = new URLSearchParams();
+  form.set("grant_type", "client_credentials");
+  form.set("client_id", clientId);
+  form.set("client_secret", clientSecret);
+
+  const j = await fetchJson(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+  });
+
+  if (!j.access_token) throw new Error("Caspio token response missing access_token");
+  return j.access_token;
+}
+
+function stripDangerousFields(payload) {
+  // Fields you never want to write from the browser at insert time
+  const deny = new Set([
+    "IDKEY",
+    "Confirmation_Number",
+
+    "StripeCheckoutSessionId",
+    "StripePaymentIntentId",
+    "StripeChargeId",
+    "StripeRefundId",
+
+    "BookingFeePaidAt",
+
+    "Transaction_ID",
+    "Transaction_date",
+
+    "CreatedAt",
+    "UpdatedAt",
+
+    // if you have any computed/readonly variants
+    "StripePolicyPaymentIntentId",
+  ]);
+
+  const out = { ...payload };
+  for (const k of Object.keys(out)) {
+    if (deny.has(k)) delete out[k];
   }
   return out;
 }
 
-function cleanString(v) {
-  const s = String(v ?? "").trim();
-  return s === "" ? "" : s;
+/**
+ * If Caspio responds with ColumnNotFound, remove missing fields and retry once.
+ * If Caspio responds with read-only, remove known computed fields and retry once.
+ */
+async function caspioInsertResilient({ table, token, payload }) {
+  const base = caspioAccountBase();
+  const restBase = `${base}/rest/v2`;
+
+  async function doInsert(body) {
+    return await fetchJson(`${restBase}/tables/${table}/records`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  try {
+    return await doInsert(payload);
+  } catch (err) {
+    const msg = String(err?.message || "");
+
+    // 1) ColumnNotFound parsing
+    if (/ColumnNotFound/i.test(msg) || /do not exist/i.test(msg)) {
+      const after = msg.split("do not exist:")[1] || "";
+      const missing = [];
+      for (const m of after.matchAll(/'([^']+)'/g)) missing.push(m[1]);
+
+      if (!missing.length) throw err;
+
+      const trimmed = { ...payload };
+      for (const f of missing) delete trimmed[f];
+
+      if (Object.keys(trimmed).length === 0) throw err;
+
+      console.warn("⚠️ Caspio ColumnNotFound. Retrying without fields:", missing);
+      return await doInsert(trimmed);
+    }
+
+    // 2) read-only hint (Caspio often doesn't list fields)
+    if (/read-?only/i.test(msg)) {
+      // Remove a broader set of typical computed fields and retry once
+      const trimmed = { ...payload };
+      const commonComputed = [
+        "IDKEY",
+        "Confirmation_Number",
+        "StripeCheckoutSessionId",
+        "StripePaymentIntentId",
+        "BookingFeePaidAt",
+        "Transaction_ID",
+        "Transaction_date",
+        "CreatedAt",
+        "UpdatedAt",
+      ];
+      for (const f of commonComputed) delete trimmed[f];
+
+      // also strip anything starting with "cb" if somehow present
+      for (const k of Object.keys(trimmed)) {
+        if (/^cb/i.test(k)) delete trimmed[k];
+      }
+
+      if (Object.keys(trimmed).length === 0) throw err;
+
+      console.warn("⚠️ Caspio read-only error. Retrying with trimmed payload.");
+      return await doInsert(trimmed);
+    }
+
+    throw err;
+  }
 }
 
-function normalizeBody(raw) {
-  // Only keep keys we expect from the front-end (prevents accidental read-only fields)
-  const b = raw && typeof raw === "object" ? raw : {};
-  return {
+function buildInsertPayload(body) {
+  // Only accept what you expect from the booking UI.
+  // Everything else is ignored.
+
+  const payload = {
+    // Force the workflow fields
+    Status: "In Process",
+    Type: "Reservation",
+
     // Contact
-    First_Name: cleanString(b.First_Name),
-    Last_Name: cleanString(b.Last_Name),
-    Email: cleanString(b.Email),
-    Phone_Number: cleanString(b.Phone_Number),
-    Cust_Notes: cleanString(b.Cust_Notes),
+    First_Name: safeString(body.First_Name, 80),
+    Last_Name: safeString(body.Last_Name, 80),
+    Email: safeString(body.Email, 160),
+    Phone_Number: safeString(body.Phone_Number, 40),
 
-    // Booking choice
-    Cancelation_Policy: cleanString(b.Cancelation_Policy), // e.g. "Agreed"
-    Charge_Type: cleanString(b.Charge_Type),               // "Pay Now" or "24 Hour Hold Fee"
+    // Booking choices
+    Business_Unit: safeString(body.Business_Unit, 40),
+    Session_Date: safeString(body.Session_Date, 10),
+    Session_ID: safeString(body.Session_ID, 80),
 
-    // Session selection
-    Business_Unit: cleanString(b.Business_Unit),
-    Session_Date: cleanString(b.Session_Date),
-    Session_ID: cleanString(b.Session_ID),
-    Item: cleanString(b.Item),
-    Price_Class: cleanString(b.Price_Class),
-    Sessions_Title: cleanString(b.Sessions_Title),
+    Item: safeString(body.Item, 120),
+    Price_Class: safeString(body.Price_Class, 80),
+    Sessions_Title: safeString(body.Sessions_Title, 255),
 
-    // Pricing selection
-    C_Quant: cleanString(b.C_Quant),
-    Units: cleanString(b.Units),
-    Unit_Price: cleanString(b.Unit_Price),
+    C_Quant: safeString(body.C_Quant, 40),
+    Units: safeString(body.Units, 40),
+    Unit_Price: safeString(body.Unit_Price, 40),
 
-    // Helpful text
-    People_Text: cleanString(b.People_Text),
+    People_Text: safeString(body.People_Text, 255),
 
-    // Due today (used by paystart)
-    BookingFeeAmount: b.BookingFeeAmount,
+    // Policy / payment selection
+    Cancelation_Policy: safeString(body.Cancelation_Policy, 60), // e.g. "Agreed"
+    Charge_Type: safeString(body.Charge_Type, 120),              // "Pay Now" or "24 Hour Hold Fee"
+    Cust_Notes: safeString(body.Cust_Notes, 4000),
 
-    // System status/type
-    Status: cleanString(b.Status || "In Process"),
-    Type: cleanString(b.Type || "Reservation"),
+    // This is what paystart uses as BookingFeeAmount
+    BookingFeeAmount: safeNumber(body.BookingFeeAmount),
   };
-}
 
-function looksLikeReadOnlyError(msg) {
-  const s = String(msg || "").toLowerCase();
-  return s.includes("read-only") || s.includes("read only");
-}
+  // Remove empties (Caspio is usually fine either way, but this helps)
+  for (const [k, v] of Object.entries(payload)) {
+    if (v === "" || v === null || v === undefined) delete payload[k];
+  }
 
-function looksLikeColumnNotFound(msg) {
-  const s = String(msg || "").toLowerCase();
-  return s.includes("columnnotfound") || s.includes("do not exist");
-}
-
-function dropMissingColumnsFromMessage(payload, msg) {
-  // If Caspio returns:
-  // "Cannot perform operation because the following field(s) do not exist: 'X','Y'"
-  const after = String(msg).split("do not exist:")[1] || "";
-  const missing = [];
-  for (const m of after.matchAll(/'([^']+)'/g)) missing.push(m[1]);
-
-  if (!missing.length) return payload;
-
-  const trimmed = { ...payload };
-  for (const f of missing) delete trimmed[f];
-  return trimmed;
-}
-
-async function getCaspioTokenFromLocalRoute(req) {
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers.host; // e.g. reservation-middleware2.vercel.app
-  const tokenUrl = `${proto}://${host}/api/caspio-token`;
-
-  const j = await fetchJson(tokenUrl, { cache: "no-store" });
-  if (!j?.access_token) throw new Error("Token endpoint missing access_token.");
-  return j.access_token;
-}
-
-async function caspioInsertReservation(token, payload) {
-  const CASPIO_BASE = "https://c0gfs257.caspio.com/rest/v2";
-  const table = process.env.CASPIO_TABLE || "BAR2_Reservations_SIGMA";
-
-  // Caspio insert endpoint
-  const url = `${CASPIO_BASE}/tables/${encodeURIComponent(table)}/records`;
-
-  return await fetchJson(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-}
-
-function extractIdKey(insertResponse) {
-  // Caspio insert responses can vary.
-  // Try a few common shapes.
-  if (!insertResponse) return null;
-
-  // Sometimes { Result: [ { IDKEY: "..." } ] }
-  const r0 = insertResponse?.Result?.[0];
-  if (r0?.IDKEY) return r0.IDKEY;
-
-  // Sometimes { Result: { IDKEY: "..." } }
-  const r1 = insertResponse?.Result;
-  if (r1?.IDKEY) return r1.IDKEY;
-
-  // Sometimes the object itself includes fields
-  if (insertResponse?.IDKEY) return insertResponse.IDKEY;
-
-  return null;
+  // Strip fields that must never be written at insert time
+  return stripDangerousFields(payload);
 }
 
 export default async function handler(req, res) {
@@ -177,121 +246,65 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
   try {
-    const token = await getCaspioTokenFromLocalRoute(req);
+    const table = process.env.CASPIO_TABLE || "BAR2_Reservations_SIGMA";
 
-    const body = normalizeBody(req.body);
+    const body = req.body || {};
+    const payload = buildInsertPayload(body);
 
-    // Attempt 1: Full payload (but already sanitized to expected keys)
-    let payload1 = { ...body };
+    // Basic validation (keep it tight—UI already validates, but don't trust it)
+    if (!payload.Email) return res.status(400).json({ ok: false, error: "Missing Email" });
+    if (!payload.First_Name) return res.status(400).json({ ok: false, error: "Missing First_Name" });
+    if (!payload.Last_Name) return res.status(400).json({ ok: false, error: "Missing Last_Name" });
+    if (!payload.Phone_Number) return res.status(400).json({ ok: false, error: "Missing Phone_Number" });
 
-    // Some people prefer not sending BookingFeeAmount/People_Text if those are computed.
-    // If you KNOW they're computed/read-only, comment them out here.
-    // delete payload1.BookingFeeAmount;
-    // delete payload1.People_Text;
+    if (!payload.Session_Date) return res.status(400).json({ ok: false, error: "Missing Session_Date" });
+    if (!payload.Business_Unit) return res.status(400).json({ ok: false, error: "Missing Business_Unit" });
+    if (!payload.Session_ID) return res.status(400).json({ ok: false, error: "Missing Session_ID" });
 
-    // Attempt 2: "Safe allowlist" (very likely writable fields)
-    const payload2 = pick(body, [
-      "First_Name",
-      "Last_Name",
-      "Email",
-      "Phone_Number",
-      "Cust_Notes",
-      "Cancelation_Policy",
-      "Charge_Type",
-      "Business_Unit",
-      "Session_Date",
-      "Session_ID",
-      "Item",
-      "Price_Class",
-      "Sessions_Title",
-      "C_Quant",
-      "Units",
-      "Unit_Price",
-      "Status",
-      "Type",
-      // optionally:
-      "People_Text",
-      "BookingFeeAmount",
-    ]);
+    if (!payload.Charge_Type) return res.status(400).json({ ok: false, error: "Missing Charge_Type" });
 
-    // Attempt 3: Minimal payload (gets the row created; lets computed fields fill if applicable)
-    const payload3 = pick(body, [
-      "First_Name",
-      "Last_Name",
-      "Email",
-      "Phone_Number",
-      "Business_Unit",
-      "Session_Date",
-      "Session_ID",
-      "Charge_Type",
-      "Status",
-      "Type",
-    ]);
-
-    const attempts = [
-      { name: "full", payload: payload1 },
-      { name: "safe", payload: payload2 },
-      { name: "minimal", payload: payload3 },
-    ];
-
-    let lastErr = null;
-    let insertJson = null;
-
-    for (const a of attempts) {
-      try {
-        insertJson = await caspioInsertReservation(token, a.payload);
-        lastErr = null;
-        break;
-      } catch (e) {
-        const msg = e?.message || String(e);
-
-        // If columns missing, trim them and retry this same attempt once
-        if (looksLikeColumnNotFound(msg)) {
-          const trimmed = dropMissingColumnsFromMessage(a.payload, msg);
-          if (Object.keys(trimmed).length && JSON.stringify(trimmed) !== JSON.stringify(a.payload)) {
-            try {
-              insertJson = await caspioInsertReservation(token, trimmed);
-              lastErr = null;
-              break;
-            } catch (e2) {
-              lastErr = e2;
-              continue;
-            }
-          }
-        }
-
-        // If read-only, move to next attempt
-        if (looksLikeReadOnlyError(msg)) {
-          lastErr = e;
-          continue;
-        }
-
-        // Other errors: stop immediately (likely real validation)
-        throw e;
-      }
+    // Paystart requires BookingFeeAmount > 0
+    if (!Number.isFinite(payload.BookingFeeAmount) || payload.BookingFeeAmount <= 0) {
+      return res.status(400).json({ ok: false, error: "Missing/invalid BookingFeeAmount" });
     }
 
-    if (lastErr) {
-      throw lastErr;
-    }
+    const token = await getCaspioToken();
 
-    const idkey = extractIdKey(insertJson);
+    const inserted = await caspioInsertResilient({
+      table,
+      token,
+      payload,
+    });
+
+    // Caspio POST usually returns created record fields; try common shapes
+    const idkey =
+      inserted?.IDKEY ||
+      inserted?.IdKey ||
+      inserted?.idkey ||
+      inserted?.Result?.IDKEY ||
+      inserted?.Result?.[0]?.IDKEY ||
+      null;
+
     if (!idkey) {
-      // Still return ok but warn; your front-end needs idkey for paystart.
-      // If this happens, we can add a follow-up lookup query to fetch the row.
-      return res.status(200).json({
+      // If Caspio doesn't return IDKEY, you can still succeed,
+      // but your front-end needs idkey to continue. So we fail loudly.
+      return res.status(500).json({
         ok: false,
-        error: "Inserted, but could not read IDKEY from Caspio response. Tell me what Caspio returned.",
-        raw: insertJson,
+        error:
+          "Insert succeeded but IDKEY was not returned. Ensure Caspio REST insert returns IDKEY, or fetch it by another key.",
+        inserted,
       });
     }
 
-    return res.status(200).json({ ok: true, idkey });
+    return res.status(200).json({
+      ok: true,
+      idkey: String(idkey),
+    });
   } catch (err) {
-    console.error("RESERVE_FAILED", err?.message || err);
+    console.error("❌ /api/reserve failed:", err?.message || err);
     return res.status(500).json({
       ok: false,
-      error: err?.message || "Server error",
+      error: oneLine(err?.message || "Server error"),
     });
   }
 }
