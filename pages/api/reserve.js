@@ -11,18 +11,23 @@ export const config = { api: { bodyParser: true } };
 
 // ---- CORS ----
 function setCors(res, origin) {
-  const ok =
-    typeof origin === "string" &&
-    /^https:\/\/(www\.)?reservebarsandrec\.com$/i.test(origin);
+  const allowed = new Set([
+    "https://www.reservebarsandrec.com",
+    "https://reservebarsandrec.com",
+  ]);
 
-  const fallback = "https://www.reservebarsandrec.com";
-  const allowOrigin = ok ? origin : fallback;
+  // Optional: if you test in Weebly preview, uncomment these:
+  // allowed.add("https://www.weebly.com");
+  // allowed.add("https://editor.weebly.com");
+
+  const allowOrigin = allowed.has(origin) ? origin : "https://www.reservebarsandrec.com";
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
+
 
 // ---- Helpers ----
 function oneLine(s) {
