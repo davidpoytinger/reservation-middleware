@@ -1,27 +1,24 @@
 // pages/api/reserve.js
 //
-// Receives booking payload from reservebarsandrec.com UI,
-// inserts into Caspio BAR2_Reservations_SIGMA,
-// returns { ok:true, idkey }.
+// Insert booking into Caspio BAR2_Reservations_SIGMA,
+// then read back the generated IDKEY by using a unique placeholder token.
 //
-// Key fixes:
+// Fixes:
 // ✅ CORS allows both www and non-www
 // ✅ OPTIONS preflight handled
-// ✅ Generates IDKEY server-side
-// ✅ Writes unique placeholder StripeCheckoutSessionId to avoid Caspio "duplicate blank" unique constraint issues
-// ✅ Sets Status="In Process", Type="Reservation"
+// ✅ Does NOT write IDKEY (often read-only / computed in Caspio)
+// ✅ Writes a unique placeholder StripeCheckoutSessionId as correlation token
+// ✅ Reads back IDKEY by querying for StripeCheckoutSessionId placeholder
+// ✅ Retries once if Caspio reports "read-only fields" by trimming them
 
-export const config = {
-  api: { bodyParser: true },
-};
+export const config = { api: { bodyParser: true } };
 
 const CASPIO_BASE = "https://c0gfs257.caspio.com/rest/v2";
 const CASPIO_OAUTH = "https://c0gfs257.caspio.com/oauth/token";
 
-// ---- CONFIG ----
 const TABLE = process.env.CASPIO_TABLE || "BAR2_Reservations_SIGMA";
 
-// Put BOTH here (Weebly usually serves from www)
+// Allow both origins (your site is currently www)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || [
   "https://reservebarsandrec.com",
   "https://www.reservebarsandrec.com",
@@ -29,7 +26,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || [
 
 function setCors(res, origin) {
   const allowOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
@@ -51,12 +47,8 @@ function normalizePhone(v) {
   return plus + digits;
 }
 
-// Simple, URL-safe ID key
-function makeIdKey(len = 10) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/1/I/O
-  let out = "";
-  for (let i = 0; i < len; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return out;
+function escWhereValue(v) {
+  return String(v ?? "").replace(/'/g, "''");
 }
 
 async function fetchJson(url, opts = {}) {
@@ -66,7 +58,7 @@ async function fetchJson(url, opts = {}) {
   try { j = text ? JSON.parse(text) : {}; } catch {}
   if (!r.ok) {
     const msg = j?.Message || j?.error_description || j?.error || text || `${r.status}`;
-    throw new Error(String(msg).slice(0, 600));
+    throw new Error(String(msg).slice(0, 800));
   }
   return j;
 }
@@ -75,7 +67,6 @@ async function getCaspioToken() {
   if (!process.env.CASPIO_CLIENT_ID) throw new Error("Missing CASPIO_CLIENT_ID");
   if (!process.env.CASPIO_CLIENT_SECRET) throw new Error("Missing CASPIO_CLIENT_SECRET");
 
-  // Caspio OAuth client credentials
   const body = new URLSearchParams();
   body.set("grant_type", "client_credentials");
   body.set("client_id", process.env.CASPIO_CLIENT_ID);
@@ -94,12 +85,73 @@ async function getCaspioToken() {
 async function caspioInsert(table, token, payload) {
   return await fetchJson(`${CASPIO_BASE}/tables/${encodeURIComponent(table)}/records`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+}
+
+async function caspioGet(table, token, where, select) {
+  const qWhere = encodeURIComponent(where);
+  const qSel = encodeURIComponent(select);
+  const url =
+    `${CASPIO_BASE}/tables/${encodeURIComponent(table)}/records` +
+    `?q.where=${qWhere}&q.select=${qSel}&q.limit=1`;
+  return await fetchJson(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+/**
+ * If Caspio says some fields are read-only, attempt to infer field names (best-effort),
+ * remove them, and retry ONCE.
+ *
+ * Caspio errors are not always consistent about listing names, so we also allow
+ * an explicit "hard blocklist" if needed later.
+ */
+function extractPossibleReadOnlyFields(message) {
+  const msg = String(message || "");
+  const fields = new Set();
+
+  // Sometimes Caspio includes quoted field names in the message
+  for (const m of msg.matchAll(/'([^']+)'/g)) {
+    const name = m[1];
+    if (name && name.length < 80) fields.add(name);
+  }
+
+  return Array.from(fields);
+}
+
+async function insertResilient(table, token, payload) {
+  try {
+    return await caspioInsert(table, token, payload);
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (!/read-only/i.test(msg)) throw err;
+
+    // Try trimming any mentioned fields
+    const ro = extractPossibleReadOnlyFields(msg);
+    const trimmed = { ...payload };
+    for (const f of ro) delete trimmed[f];
+
+    // If message didn’t name fields, we still do a safe fallback trim set
+    // based on the most common read-only culprits in reservation schemas.
+    // (This does NOT move your UI around; it just makes insert succeed.)
+    const fallbackTrim = [
+      "IDKEY",
+      "Confirmation_Number",
+      "Transaction_ID",
+      "Transaction_date",
+      "BookingFeePaidAt",
+      "CreatedAt",
+      "UpdatedAt",
+    ];
+    for (const f of fallbackTrim) delete trimmed[f];
+
+    // If we didn't remove anything, rethrow original
+    if (Object.keys(trimmed).length === Object.keys(payload).length) throw err;
+
+    return await caspioInsert(table, token, trimmed);
+  }
 }
 
 export default async function handler(req, res) {
@@ -112,7 +164,7 @@ export default async function handler(req, res) {
   try {
     const b = req.body || {};
 
-    // ---- Validate basics ----
+    // ---- Validate required fields (minimal + your flow requirements) ----
     const First_Name = oneLine(b.First_Name);
     const Last_Name  = oneLine(b.Last_Name);
     const Email      = oneLine(b.Email);
@@ -121,7 +173,9 @@ export default async function handler(req, res) {
     if (!First_Name) return res.status(400).json({ ok:false, error:"Missing First_Name" });
     if (!Last_Name)  return res.status(400).json({ ok:false, error:"Missing Last_Name" });
     if (!Email || !isValidEmail(Email)) return res.status(400).json({ ok:false, error:"Missing/invalid Email" });
-    if (!Phone_Number || normalizePhone(Phone_Number).replace(/\D/g,"").length < 10) {
+
+    const phoneNorm = normalizePhone(Phone_Number);
+    if (!Phone_Number || phoneNorm.replace(/\D/g, "").length < 10) {
       return res.status(400).json({ ok:false, error:"Missing/invalid Phone_Number" });
     }
 
@@ -141,26 +195,25 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok:false, error:"Missing/invalid BookingFeeAmount" });
     }
 
-    // ---- Generate IDKEY here so we can return it immediately ----
-    const IDKEY = makeIdKey(10);
+    // ---- Correlation token used to find the inserted row ----
+    // Must be UNIQUE (so Caspio unique constraint is satisfied and lookup is reliable)
+    const correlation = `pending_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-    // IMPORTANT:
-    // If Caspio treats blank as duplicate on unique fields,
-    // set unique placeholder values until paystart overwrites them.
-    const stripePlaceholder = `pending_${IDKEY}_${Date.now()}`;
-
-    // ---- Build insert payload (only writable fields) ----
+    // ---- Build insert payload (avoid IDKEY) ----
     const payload = {
-      IDKEY,
+      // DO NOT send IDKEY here — let Caspio generate it if it's computed.
 
-      // Required booking fields
       Status: "In Process",
       Type: "Reservation",
 
       First_Name,
       Last_Name,
       Email,
-      Phone_Number,
+      Phone_Number: phoneNorm,
+
+      Cancelation_Policy: oneLine(b.Cancelation_Policy || "Agreed"),
+      Charge_Type,
+      Cust_Notes: oneLine(b.Cust_Notes),
 
       Business_Unit,
       Session_Date,
@@ -175,24 +228,36 @@ export default async function handler(req, res) {
       Unit_Price: oneLine(b.Unit_Price),
 
       People_Text: oneLine(b.People_Text),
-      Cust_Notes: oneLine(b.Cust_Notes),
-
-      Cancelation_Policy: oneLine(b.Cancelation_Policy || "Agreed"),
-      Charge_Type,
-
       BookingFeeAmount,
 
-      // placeholders to satisfy uniqueness (paystart will overwrite)
-      StripeCheckoutSessionId: stripePlaceholder,
-      StripePaymentIntentId: stripePlaceholder,
+      // placeholder fields (if writable) — used for uniqueness + lookup
+      StripeCheckoutSessionId: correlation,
+      StripePaymentIntentId: correlation,
     };
 
     const token = await getCaspioToken();
 
-    // Insert
-    await caspioInsert(TABLE, token, payload);
+    // Insert (resilient to read-only fields)
+    await insertResilient(TABLE, token, payload);
 
-    return res.status(200).json({ ok: true, idkey: IDKEY });
+    // Read back the generated IDKEY using the correlation token
+    const where = `StripeCheckoutSessionId='${escWhereValue(correlation)}'`;
+    const got = await caspioGet(TABLE, token, where, "IDKEY,RES_ID,Session_ID,Session_Date,Email");
+
+    const row = got?.Result?.[0] || null;
+    const idkey = row?.IDKEY || null;
+
+    if (!idkey) {
+      // If Caspio stripped StripeCheckoutSessionId as read-only, lookup will fail.
+      // In that case, throw a clear message so you know which field is read-only.
+      throw new Error(
+        "Insert succeeded but could not read back IDKEY. " +
+        "This usually means StripeCheckoutSessionId is read-only OR Caspio did not save it. " +
+        "Make StripeCheckoutSessionId writable (not computed) or provide a dedicated writable correlation field."
+      );
+    }
+
+    return res.status(200).json({ ok: true, idkey });
   } catch (err) {
     console.error("reserve.js error:", err?.message || err);
     return res.status(500).json({ ok:false, error: err?.message || "Server error" });
