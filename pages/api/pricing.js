@@ -2,14 +2,23 @@
 import { listViewRecordsByWhere, escapeWhereValue } from "../../lib/caspio";
 
 function setCors(res, origin) {
-  const allowed = process.env.ALLOWED_ORIGIN || "https://www.reservebarsandrec.com";
-  const allowOrigin = origin && origin === allowed ? origin : allowed;
+  const allowed = new Set([
+    "https://www.reservebarsandrec.com",
+    "https://reservebarsandrec.com",
+  ]);
+
+  // Optional: if you test in Weebly preview, uncomment these:
+  // allowed.add("https://www.weebly.com");
+  // allowed.add("https://editor.weebly.com");
+
+  const allowOrigin = allowed.has(origin) ? origin : "https://www.reservebarsandrec.com";
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
+
 
 const TTL_MS = 15 * 60 * 1000; // 15 minutes
 const cache = new Map();
