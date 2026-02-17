@@ -9,13 +9,9 @@
 // ✅ Uses /api/caspio-token to obtain Caspio access token (server-side)
 
 function setCors(res, origin) {
-  // IMPORTANT: If your Weebly site sometimes hits with/without www,
-  // you can set ALLOWED_ORIGIN to one canonical value, OR extend this.
-  const allowed = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
-
-  // If you want to allow both, set env var like:
-  // ALLOWED_ORIGINS="https://reservebarsandrec.com,https://www.reservebarsandrec.com"
-  const allowedList = String(process.env.ALLOWED_ORIGINS || allowed)
+  const allowedList = String(
+    process.env.ALLOWED_ORIGINS || "https://reservebarsandrec.com"
+  )
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -25,8 +21,9 @@ function setCors(res, origin) {
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
+
 
 async function fetchJson(url, opts = {}) {
   const r = await fetch(url, opts);
@@ -127,16 +124,10 @@ function dropMissingColumnsFromMessage(payload, msg) {
 }
 
 async function getCaspioTokenFromLocalRoute(req) {
-  // Use the SAME deployment base URL if available; fall back to absolute env.
-  const host =
-    process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : (process.env.MIDDLEWARE_BASE_URL || "");
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const host = req.headers.host; // e.g. reservation-middleware2.vercel.app
+  const tokenUrl = `${proto}://${host}/api/caspio-token`;
 
-  // If host not present, we can call relative route inside Vercel runtime:
-  const tokenUrl = host ? `${host}/api/caspio-token` : `http://localhost:3000/api/caspio-token`;
-
-  // In Vercel serverless, relative fetch can be flaky; absolute is safer.
   const j = await fetchJson(tokenUrl, { cache: "no-store" });
   if (!j?.access_token) throw new Error("Token endpoint missing access_token.");
   return j.access_token;
