@@ -20,7 +20,7 @@ function setCors(res, origin) {
 }
 
 
-const TTL_MS = 10 * 60 * 1000; // 10 minutes
+const TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const cache = new Map();
 
 function cacheGet(key) {
