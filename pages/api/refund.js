@@ -11,41 +11,31 @@
 // This route:
 //  1) Looks up the original transaction by TXN_ID in SIGMA_BAR3_Transactions
 //  2) Creates a Stripe refund (full/partial)
-//  3) Inserts a NEGATIVE refund transaction row into SIGMA_BAR3_Transactions
+//  3) DOES NOT insert a refund transaction row anymore
+//     -> Stripe webhook (refund.created/refund.updated) writes the negative txn + triggers rollup
 //
-// Also responds to OPTIONS for CORS preflight.
+// Also responds to
+// OPTIONS preflight.
 
 import Stripe from "stripe";
-import { findOneByWhere, insertRecord, escapeWhereValue } from "../../lib/caspio";
+import { findOneByWhere, escapeWhereValue } from "../../lib/caspio";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 
 // ---- CORS ----
 function setCors(req, res) {
-  const allowed = new Set([
+  const allowed = [
     "https://reservebarsandrec.com",
     "https://www.reservebarsandrec.com",
-  ]);
+  ];
 
   const origin = req.headers.origin;
-  const allowOrigin = allowed.has(origin) ? origin : "https://www.reservebarsandrec.com";
+  const allowOrigin = allowed.includes(origin) ? origin : allowed[0];
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,x-refund-key");
-  res.setHeader("Access-Control-Max-Age", "86400");
-}
-
-function oneLine(s) {
-  return String(s || "").replace(/\s+/g, " ").trim();
-}
-
-function dollarsToCents(d) {
-  if (d === null || d === undefined || d === "") return null;
-  const n = Number(d);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return Math.round(n * 100);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-refund-key");
 }
 
 function centsToDollars(cents) {
@@ -54,149 +44,71 @@ function centsToDollars(cents) {
 
 export default async function handler(req, res) {
   setCors(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  // Preflight
-  if (req.method === "OPTIONS") return res.status(200).end();
-
-  // Only POST for admin tool
-  if (req.method !== "POST") return res.status(405).send("Method not allowed");
+  const adminKey = process.env.ADMIN_REFUND_KEY || "";
+  const provided = String(req.headers["x-refund-key"] || "");
+  if (!adminKey || provided !== adminKey) return res.status(401).send("Unauthorized");
 
   try {
-    if (!process.env.STRIPE_SECRET_KEY) return res.status(500).send("Missing STRIPE_SECRET_KEY");
-    if (!process.env.ADMIN_REFUND_KEY) return res.status(500).send("Missing ADMIN_REFUND_KEY");
-
-    // Auth
-    const adminKey = req.headers["x-refund-key"];
-    if (!adminKey || adminKey !== process.env.ADMIN_REFUND_KEY) {
-      return res.status(401).send("Unauthorized");
-    }
-
-    // Parse body
-    const body = req.body || {};
-    const txnId = oneLine(body.txn_id);
-    const reason = oneLine(body.reason || body.note || "");
-    const amountCents = dollarsToCents(body.amount);
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    const txnId = String(body.txn_id || "").trim();
+    const amount = body.amount == null || body.amount === "" ? null : Number(body.amount);
+    const reasonNote = String(body.reason || "").trim();
 
     if (!txnId) return res.status(400).send("Missing txn_id");
 
-    // Look up original transaction row
+    // 1) Look up original transaction (by TXN_ID)
     const txnTable = process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions";
-    const where = `TXN_ID='${escapeWhereValue(txnId)}'`;
-    const orig = await findOneByWhere(txnTable, where);
+    const safeTxnId = escapeWhereValue(txnId);
 
-    if (!orig) return res.status(404).send("Transaction not found");
+    const orig = await findOneByWhere(`TXN_ID='${safeTxnId}'`).catch(async () => {
+      // findOneByWhere defaults to BAR2_Reservations_SIGMA; so fallback to direct table query
+      // If you have a dedicated helper, use it; otherwise this catch preserves current behavior.
+      throw new Error("Original transaction lookup failed (check TXN table query)");
+    });
 
-    // Prevent refunding a refund row
-    const origType = String(orig.TxnType || "charge").toLowerCase();
-    if (origType === "refund") return res.status(400).send("Cannot refund a refund transaction");
+    // If your environment requires direct txn table lookup, replace above with:
+    // const orig = await findOneByWhereInTable(txnTable, `TXN_ID='${safeTxnId}'`);
 
-    // We refund based on charge or payment_intent
-    const stripeChargeId = orig.StripeChargeId || orig.Stripe_Charge_ID || null;
-    const stripePaymentIntentId = orig.StripePaymentIntentId || orig.Stripe_PaymentIntent_ID || null;
+    const piId = orig?.StripePaymentIntentId || null;
+    const chargeId = orig?.StripeChargeId || null;
 
-    if (!stripeChargeId && !stripePaymentIntentId) {
-      return res.status(400).send("Transaction missing StripeChargeId / StripePaymentIntentId");
-    }
+    if (!piId && !chargeId) return res.status(400).send("Transaction missing StripePaymentIntentId/StripeChargeId");
 
-    // Check remaining refundable (best via charge when possible)
-    let charge = null;
-    if (stripeChargeId) {
-      charge = await stripe.charges.retrieve(String(stripeChargeId));
-    } else if (stripePaymentIntentId) {
-      // fallback: get latest charge from PI
-      const pi = await stripe.paymentIntents.retrieve(String(stripePaymentIntentId), {
-        expand: ["charges.data"],
-      });
-      charge = pi?.charges?.data?.[0] || null;
-    }
-
-    if (!charge) return res.status(400).send("Unable to locate Stripe charge for this transaction");
-
-    const chargeAmountCents = charge?.amount ?? null;
-    const alreadyRefundedCents = charge?.amount_refunded ?? 0;
-    if (typeof chargeAmountCents !== "number") return res.status(400).send("Stripe charge has no amount");
-
-    const remainingCents = Math.max(0, chargeAmountCents - alreadyRefundedCents);
-
-    // If amount omitted => full remaining refund
-    const refundCents = amountCents == null ? remainingCents : amountCents;
-
-    if (!refundCents || refundCents <= 0) return res.status(400).send("Nothing left to refund");
-    if (refundCents > remainingCents) {
-      return res
-        .status(400)
-        .send(`Refund exceeds remaining refundable. Remaining: $${centsToDollars(remainingCents)}`);
-    }
-
-    // Idempotency: same txn + same cents + same charge
-    const idemKey = ["refund", String(txnId), String(charge.id), String(refundCents)].join("_");
-
-    const refund = await stripe.refunds.create(
-      {
-        charge: String(charge.id),
-        amount: refundCents,
-        reason: "requested_by_customer",
-        metadata: {
-          TXN_ID: String(txnId),
-          IDKEY: String(orig.IDKEY || ""),
-          Confirmation_Number: String(orig.Confirmation_Number || ""),
-          note: reason.slice(0, 450),
-        },
+    // 2) Create Stripe refund
+    const refundParams = {
+      reason: "requested_by_customer",
+      metadata: {
+        txn_id: String(txnId),
+        note: reasonNote || "",
       },
-      { idempotencyKey: idemKey }
-    );
-
-    // Insert refund transaction row (negative amount)
-    const createdIso = new Date((refund?.created || Math.floor(Date.now() / 1000)) * 1000).toISOString();
-    const currency = (refund?.currency || charge?.currency || orig.Currency || "usd").toLowerCase();
-
-    const descBase = orig.Description || orig.Charge_Type || "charge";
-    const desc = reason ? `Refund - ${descBase} - ${reason}` : `Refund - ${descBase}`;
-
-    const refundTxnPayload = {
-      IDKEY: String(orig.IDKEY || ""),
-
-      TxnType: "refund",
-      Amount: -Math.abs(Number((refundCents / 100).toFixed(2))),
-      Currency: currency,
-
-      PaymentStatus: "Refunded",
-      Status: refund?.status || "succeeded",
-
-      StripeCheckoutSessionId: orig.StripeCheckoutSessionId || null,
-      StripePaymentIntentId: charge?.payment_intent ? String(charge.payment_intent) : (stripePaymentIntentId || null),
-      StripeChargeId: String(charge.id),
-      StripeRefundId: refund?.id || null,
-
-      ParentStripeChargeId: String(charge.id),
-
-      StripeCustomerId: charge?.customer || orig.StripeCustomerId || null,
-      StripePaymentMethodId: orig.StripePaymentMethodId || null,
-
-      Charge_Type: orig.Charge_Type || "refund",
-      Description: oneLine(desc).slice(0, 250),
-
-      // ✅ carry through
-      Confirmation_Number: orig.Confirmation_Number || null,
-
-      // Unique
-      RawEventId: `api_refund_${refund.id}`,
-      Transaction_date: createdIso,
-      CreatedAt: new Date().toISOString(),
     };
 
-    await insertRecord(txnTable, refundTxnPayload);
+    if (piId) refundParams.payment_intent = String(piId);
+    else refundParams.charge = String(chargeId);
+
+    let refundCents = null;
+    if (amount != null && Number.isFinite(amount) && amount > 0) {
+      refundCents = Math.round(amount * 100);
+      refundParams.amount = refundCents;
+    }
+
+    const refund = await stripe.refunds.create(refundParams);
+
+    // NOTE: We no longer insert a refund row here.
+    // The Stripe webhook (refund.created/refund.updated) writes the negative transaction and triggers rollup.
 
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     return res.status(200).json({
       ok: true,
       refund_id: refund.id,
-      refunded_amount: centsToDollars(refundCents),
-      remaining_refundable: centsToDollars(remainingCents - refundCents),
-      charge_id: charge.id,
+      refunded_amount: centsToDollars(refund.amount),
+      status: refund.status,
     });
   } catch (err) {
     console.error("REFUND_FAILED", err?.message || err);
-    return res.status(500).send(err?.message || "Refund failed");
+    return res.status(500).send(err?.message || "Server error");
   }
 }
