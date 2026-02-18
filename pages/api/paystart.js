@@ -7,6 +7,8 @@
 // ✅ Ensures a Stripe Customer exists and is used for Checkout
 // ✅ Uses setup_future_usage=off_session so the payment method can be reused later
 // ❌ Does NOT use payment_method_collection (not allowed for one-time payment Checkout)
+//
+// ✅ UPDATED: redirects to barresv5custmanage.html (not after.html)
 
 import Stripe from "stripe";
 import {
@@ -38,7 +40,7 @@ function idemKeyForCheckout({ idkey, amountCents, resId }) {
 }
 
 function setCors(res, origin) {
-  const allowed = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
+  const allowed = process.env.ALLOWED_ORIGIN || "https://www.reservebarsandrec.com";
   const allowOrigin = origin && origin === allowed ? origin : allowed;
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -157,13 +159,14 @@ export default async function handler(req, res) {
     }
 
     // 3) Create Checkout Session
-    const allowedOrigin = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
-    const successUrl = `${allowedOrigin}/after.html?idkey=${encodeURIComponent(idkey)}&res_id=${encodeURIComponent(
-      resId || ""
-    )}`;
-    const cancelUrl = `${allowedOrigin}/cancel.html?idkey=${encodeURIComponent(idkey)}&res_id=${encodeURIComponent(
-      resId || ""
-    )}`;
+    // ✅ UPDATED redirect pages:
+    const allowedOrigin = process.env.ALLOWED_ORIGIN || "https://www.reservebarsandrec.com";
+    const successUrl = `${allowedOrigin}/barresv5custmanage.html?idkey=${encodeURIComponent(
+      idkey
+    )}&res_id=${encodeURIComponent(resId || "")}`;
+    const cancelUrl = `${allowedOrigin}/barresv5custmanage.html?idkey=${encodeURIComponent(
+      idkey
+    )}&res_id=${encodeURIComponent(resId || "")}`;
 
     const session = await stripe.checkout.sessions.create(
       {
