@@ -84,25 +84,42 @@ function getConfirmationNumberFromReservationRow(row) {
 
 /**
  * Parse 4-part breakdown from Stripe metadata.
- * Expected keys: base_amount, grat_amount, tax_amount, fee_amount (strings)
- * Fallback: Fee-only = totalAmountDollars (e.g., booking fee legacy)
+ * Accepts BOTH:
+ *  - snake_case (base_amount, grat_amount, tax_amount, fee_amount)
+ *  - Caspio-style (Base_Amount, Auto_Gratuity, Tax, Fee)
+ *
+ * Fallback:
+ *  - If no breakdown found: treat entire totalAmountDollars as Fee (legacy behavior)
  */
 function parseBreakdown(meta, totalAmountDollars) {
+  const m = meta || {};
+
+  // Accept multiple key styles
+  const baseRaw =
+    m.base_amount ?? m.baseAmount ?? m.Base_Amount ?? m.base ?? m.Base ?? null;
+
+  const gratRaw =
+    m.grat_amount ?? m.gratAmount ?? m.Auto_Gratuity ?? m.auto_gratuity ?? m.grat ?? m.Gratuity ?? null;
+
+  const taxRaw =
+    m.tax_amount ?? m.taxAmount ?? m.Tax ?? m.tax ?? null;
+
+  const feeRaw =
+    m.fee_amount ?? m.feeAmount ?? m.Fee ?? m.fee ?? null;
+
   const hasAny =
-    meta?.base_amount != null ||
-    meta?.grat_amount != null ||
-    meta?.tax_amount != null ||
-    meta?.fee_amount != null;
+    baseRaw != null || gratRaw != null || taxRaw != null || feeRaw != null;
 
   if (hasAny) {
-    const base = n2(meta?.base_amount);
-    const grat = n2(meta?.grat_amount);
-    const tax = n2(meta?.tax_amount);
-    const fee = n2(meta?.fee_amount);
+    const base = n2(baseRaw);
+    const grat = n2(gratRaw);
+    const tax = n2(taxRaw);
+    const fee = n2(feeRaw);
     const amount = n2(base + grat + tax + fee);
     return { base, grat, tax, fee, amount };
   }
 
+  // Legacy fallback: all in Fee
   const total = n2(totalAmountDollars);
   return { base: 0, grat: 0, tax: 0, fee: total, amount: total };
 }
@@ -277,11 +294,15 @@ export default async function handler(req, res) {
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      // 4-part breakdown for ledger insert
-      const breakdown = parseBreakdown(
-        paymentIntent?.metadata || fullSession?.metadata || session?.metadata || {},
-        amountDollars
-      );
+// IMPORTANT: For Checkout, Session metadata is the most reliable place.
+// (Sometimes paymentIntent.metadata is not what you expect depending on how session was created.)
+const mdSession = fullSession?.metadata || session?.metadata || {};
+const mdPI = paymentIntent?.metadata || {};
+
+console.log("MD_KEYS_SESSION:", Object.keys(mdSession || {}));
+console.log("MD_KEYS_PI:", Object.keys(mdPI || {}));
+
+const breakdown = parseBreakdown(mdSession, amountDollars);
 
       // Transaction insert (components + confirmation)
       let reservationChargeType = metaChargeType;
@@ -371,7 +392,8 @@ export default async function handler(req, res) {
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
+      console.log("MD_KEYS_PI_OFFSESSION:", Object.keys(piFull?.metadata || {}));
+const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
 
       const txnPayload = {
         IDKEY: String(idkey),
