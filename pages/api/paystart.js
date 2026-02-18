@@ -71,7 +71,7 @@ export default async function handler(req, res) {
     // ---- 4-part breakdown (optional query params; defaults fee-only = booking fee) ----
     const q = req.query || {};
     let baseAmt = num2(q.base_amount);
-    let gratAmt = num2(q.auto_gratuity);
+    let gratAmt = num2(q.grat_amount ?? q.auto_gratuity);
     let taxAmt = num2(q.tax_amount);
     let feeAmt = num2(q.fee_amount);
 
