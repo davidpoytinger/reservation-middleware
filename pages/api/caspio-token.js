@@ -1,3 +1,8 @@
+// pages/api/caspio-token.js
+//
+// Returns a Caspio OAuth token for client-side calls.
+// CORS-safe for site + sandboxed embeds (Origin: null).
+
 export default async function handler(req, res) {
   // ---- CORS ----
   const allowed = new Set([
@@ -7,13 +12,15 @@ export default async function handler(req, res) {
 
   const origin = req.headers.origin || "";
 
-  // Weebly embeds / previews sometimes send Origin: null.
-  // Since this endpoint does NOT use cookies/credentials, it's safe to allow "*".
+  // Sandbox/preview embeds sometimes send Origin: null.
+  // This route does not use cookies/credentials, so wildcard is OK.
   let allowOrigin;
   if (!origin || origin === "null") {
     allowOrigin = "*";
+  } else if (allowed.has(origin)) {
+    allowOrigin = origin;
   } else {
-    allowOrigin = allowed.has(origin) ? origin : "https://www.reservebarsandrec.com";
+    allowOrigin = "https://www.reservebarsandrec.com";
   }
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -29,7 +36,9 @@ export default async function handler(req, res) {
     const clientSecret = process.env.CASPIO_CLIENT_SECRET;
 
     if (!clientId || !clientSecret) {
-      return res.status(500).json({ error: "Missing CASPIO_CLIENT_ID or CASPIO_CLIENT_SECRET" });
+      return res
+        .status(500)
+        .json({ error: "Missing CASPIO_CLIENT_ID or CASPIO_CLIENT_SECRET" });
     }
 
     const tokenUrl = "https://c0gfs257.caspio.com/oauth/token";
@@ -43,3 +52,27 @@ export default async function handler(req, res) {
     const r = await fetch(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+
+    const j = await r.json();
+
+    if (!r.ok) {
+      return res.status(r.status).json({
+        error: "Caspio token request failed",
+        details: j,
+      });
+    }
+
+    return res.status(200).json({
+      access_token: j.access_token,
+      expires_in: j.expires_in,
+      token_type: j.token_type,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      error: "Server error",
+      details: String(e?.message || e),
+    });
+  }
+}
