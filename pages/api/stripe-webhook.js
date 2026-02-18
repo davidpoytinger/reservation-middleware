@@ -1,9 +1,7 @@
 import Stripe from "stripe";
 import {
-  updateReservationByWhere,
   insertTransactionIfMissingByRawEventId,
   getReservationByIdKey,
-  getResBillingEditViewRowByIdKey,
   rollupTotalsForIdKey,
 } from "../../lib/caspio";
 
@@ -85,28 +83,6 @@ function getConfirmationNumberFromReservationRow(row) {
   );
 }
 
-/**
- * If Caspio responds with ColumnNotFound, drop those fields and retry once.
- */
-async function updateReservationResilient(where, payload) {
-  try {
-    return await updateReservationByWhere(where, payload);
-  } catch (err) {
-    const msg = String(err?.message || "");
-    if (!/ColumnNotFound/i.test(msg) && !/do not exist/i.test(msg)) throw err;
-
-    const after = msg.split("do not exist:")[1] || "";
-    const missing = [];
-    for (const m of after.matchAll(/'([^']+)'/g)) missing.push(m[1]);
-    if (!missing.length) throw err;
-
-    const trimmed = { ...payload };
-    for (const k of missing) delete trimmed[k];
-
-    return await updateReservationByWhere(where, trimmed);
-  }
-}
-
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
@@ -124,7 +100,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Small cache to avoid double Caspio reads within one webhook
+    // Cache to avoid repeated Caspio reads inside same event
     let reservationCache = null;
 
     async function getReservationCached(idkey) {
@@ -135,7 +111,7 @@ export default async function handler(req, res) {
     }
 
     // ------------------------------------------------------------
-    // 1) CHECKOUT COMPLETED (writes txn breakdown + rollup)
+    // 1) CHECKOUT COMPLETED (ONLY source for checkout payments)
     // ------------------------------------------------------------
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
@@ -143,10 +119,7 @@ export default async function handler(req, res) {
       const idkey = getIdKeyFromMetadata(session?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
 
-      const metaChargeType = session?.metadata?.Charge_Type || null;
-      const metaSessionsTitle = session?.metadata?.Sessions_Title || null;
-
-      // Expand payment intent to get charge/card details
+      // Expand PI to get charge/card details
       let paymentIntent = session?.payment_intent;
       if (typeof paymentIntent === "string") {
         paymentIntent = await stripe.paymentIntents.retrieve(paymentIntent, {
@@ -170,15 +143,10 @@ export default async function handler(req, res) {
         ((paymentIntent?.created || session?.created || Math.floor(Date.now() / 1000)) * 1000)
       ).toISOString();
 
-      // If this reservation has a Charge_Type we want to prefer it
       const reservationRow = await getReservationCached(idkey);
-      let reservationChargeType =
-        metaChargeType ||
-        reservationRow?.Charge_Type ||
-        "booking_fee";
-
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
+      // Prefer PI metadata but allow session metadata
       const breakdown = parseBreakdownFromMetadata(
         paymentIntent?.metadata || session?.metadata || {},
         amountDollars
@@ -186,7 +154,6 @@ export default async function handler(req, res) {
 
       const txnPayload = {
         IDKEY: String(idkey),
-
         TxnType: "charge",
 
         Base_Amount: breakdown.base,
@@ -197,7 +164,7 @@ export default async function handler(req, res) {
         Amount: breakdown.amount,
         Currency: currency,
 
-        PaymentStatus: "PaidBookingFee",
+        PaymentStatus: "Paid",
         Status: paymentIntent?.status || "succeeded",
 
         StripeCheckoutSessionId: session?.id || null,
@@ -210,10 +177,10 @@ export default async function handler(req, res) {
         Card_Exp_Month: card?.exp_month || null,
         Card_Exp_Year: card?.exp_year || null,
 
-        Sessions_Title: metaSessionsTitle || reservationRow?.Sessions_Title || null,
-        Description: reservationChargeType,
+        Charge_Type: session?.metadata?.Charge_Type || paymentIntent?.metadata?.Charge_Type || null,
+        Description: paymentIntent?.description || session?.metadata?.Description || null,
 
-        // ✅ NEW FIELD
+        RES_ID: getResIdFromMetadata(session?.metadata) || getResIdFromMetadata(paymentIntent?.metadata) || null,
         Confirmation_Number: confirmationNumber,
 
         RawEventId: String(event.id),
@@ -231,17 +198,24 @@ export default async function handler(req, res) {
     }
 
     // ------------------------------------------------------------
-    // 2) PAYMENT INTENT SUCCEEDED (off-session charges)
+    // 2) PAYMENT INTENT SUCCEEDED (ONLY source for off-session charges)
     // ------------------------------------------------------------
     if (event.type === "payment_intent.succeeded") {
       const paymentIntent = event.data.object;
+
+      // ✅ Gate: ONLY log if this PI is an off-session charge tool payment
+      const source = String(paymentIntent?.metadata?.source || "").toLowerCase();
+      if (source !== "off_session" && source !== "off-session") {
+        // This prevents double-logging Checkout payments.
+        return res.status(200).json({ received: true, skipped: "not_off_session" });
+      }
 
       const idkey = getIdKeyFromMetadata(paymentIntent?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
 
       const resId = getResIdFromMetadata(paymentIntent?.metadata);
 
-      // Expand PI to get card data if available
+      // Expand PI to get card data
       const piFull = await stripe.paymentIntents.retrieve(paymentIntent.id, {
         expand: ["payment_method", "charges.data.payment_method_details"],
       });
@@ -251,23 +225,17 @@ export default async function handler(req, res) {
         charge?.payment_method_details?.card ||
         (typeof piFull?.payment_method !== "string" ? piFull?.payment_method?.card : null);
 
-      const amountDollars = dollarsFromCents(
-        piFull?.amount_received ?? piFull?.amount ?? null
-      );
+      const amountDollars = dollarsFromCents(piFull?.amount_received ?? piFull?.amount ?? null);
       const currency = String(piFull?.currency || "usd").toLowerCase();
       const paidAtIso = new Date(((piFull?.created || Math.floor(Date.now() / 1000)) * 1000)).toISOString();
 
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      const breakdown = parseBreakdownFromMetadata(
-        piFull?.metadata || paymentIntent?.metadata || {},
-        amountDollars
-      );
+      const breakdown = parseBreakdownFromMetadata(piFull?.metadata || {}, amountDollars);
 
       const txnPayload = {
         IDKEY: String(idkey),
-
         TxnType: "charge",
 
         Base_Amount: breakdown.base,
@@ -312,7 +280,7 @@ export default async function handler(req, res) {
     }
 
     // ------------------------------------------------------------
-    // 3) REFUNDS (create NEGATIVE txn rows + rollup)
+    // 3) REFUNDS (still log here; one refund event = one refund txn row)
     // ------------------------------------------------------------
     if (event.type === "refund.created" || event.type === "refund.updated") {
       const refund = event.data.object;
@@ -350,7 +318,6 @@ export default async function handler(req, res) {
 
       const txnPayload = {
         IDKEY: String(idkey),
-
         TxnType: "refund",
 
         Base_Amount: -Math.abs(rb.base),
@@ -358,7 +325,6 @@ export default async function handler(req, res) {
         Tax: -Math.abs(rb.tax),
         Fee: -Math.abs(rb.fee),
 
-        // negative amount
         Amount: typeof amountDollars === "number" ? -Math.abs(refundTotal) : null,
         Currency: currency,
 
@@ -367,7 +333,7 @@ export default async function handler(req, res) {
 
         StripeCheckoutSessionId: null,
         StripePaymentIntentId: paymentIntentId || null,
-        StripeChargeId: chargeId,
+        StripeChargeId: chargeId || null,
         StripeRefundId: refund?.id || null,
         StripeCustomerId: pi?.customer || null,
 
@@ -390,7 +356,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ received: true });
     }
 
-    // Anything else: just ACK
+    // Anything else: ACK
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error("WEBHOOK_HANDLER_FAILED", err?.message || err);
