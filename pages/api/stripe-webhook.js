@@ -1,4 +1,11 @@
 // pages/api/stripe-webhook.js
+//
+// Debug-enabled Stripe webhook for SIGMA
+// - Adds safe debug logs for billing view lookup + keys
+// - Keeps "one transaction per successful checkout" behavior
+// - Off-session PI logging is gated by metadata.source === "off_session"
+// - Removes RES_ID from transaction inserts
+// - Rolls up totals (no UpdatedAt expected in rollup table)
 
 import Stripe from "stripe";
 import {
@@ -32,6 +39,14 @@ function dollarsFromCents(cents) {
 function n2(v) {
   const n = Number(v);
   return Number.isFinite(n) ? Number(n.toFixed(2)) : 0;
+}
+
+function pickFirst(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return null;
 }
 
 /**
@@ -95,6 +110,7 @@ function parseBreakdown(meta, totalAmountDollars) {
 async function safeRollup(idkey) {
   try {
     await rollupTotalsForIdKey(String(idkey));
+    console.log("ROLLUP_OK:", String(idkey));
   } catch (e) {
     console.warn("⚠️ ROLLUP_FAILED (non-blocking)", e?.message || e);
   }
@@ -113,6 +129,9 @@ export default async function handler(req, res) {
     console.error("❌ Stripe signature verification failed:", err?.message || err);
     return res.status(400).send(`Webhook Error: ${err?.message || "bad signature"}`);
   }
+
+  // ---- DEBUG breadcrumb: what event are we processing?
+  console.log("STRIPE_EVENT:", event?.type, "EVENT_ID:", event?.id);
 
   try {
     // Cache reservation row per webhook execution
@@ -133,6 +152,8 @@ export default async function handler(req, res) {
 
       const idkey = getIdKeyFromMetadata(session?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
+
+      console.log("CHECKOUT_COMPLETED_IDKEY:", String(idkey));
 
       const metaChargeType = session?.metadata?.Charge_Type || null;
       const metaSessionsTitle = session?.metadata?.Sessions_Title || null;
@@ -173,6 +194,10 @@ export default async function handler(req, res) {
 
       const where = `IDKEY='${escapeWhereValue(idkey)}'`;
 
+      // ---- DEBUG breadcrumbs: billing view configured? did we get a row?
+      const billingViewName = String(process.env.CASPIO_RES_BILLING_VIEW || "").trim();
+      console.log("BILLING_VIEW_NAME:", billingViewName || "(not set)");
+
       // VIEW LOOKUP (non-blocking)
       let viewRow = null;
       try {
@@ -180,6 +205,9 @@ export default async function handler(req, res) {
       } catch (e) {
         console.warn("⚠️ VIEW_LOOKUP_FAILED (non-blocking)", e?.message || e);
       }
+
+      console.log("BILLING_VIEW_ROW:", viewRow ? "found" : "null");
+      if (viewRow) console.log("BILLING_VIEW_KEYS:", Object.keys(viewRow));
 
       // Reservation update payload
       const payload = {
@@ -203,19 +231,44 @@ export default async function handler(req, res) {
       if (metaSessionsTitle) payload.Sessions_Title = metaSessionsTitle;
       if (metaPeopleText) payload.People_Text = metaPeopleText;
 
+      // Enrichment mapping (handles alias drift)
       if (viewRow) {
-        if (viewRow.BAR2_Email_Design_Email_Content) {
+        const emailHtml = pickFirst(viewRow, [
+          "BAR2_Email_Design_Email_Content",
+          "Email_Design_Email_Content",
+          "Email_Design",
+          "Email_Content",
+          "BAR2_Email_Design",
+          "EmailHTML",
+        ]);
+
+        if (emailHtml) {
           const maxLen = 64000;
-          const val = String(viewRow.BAR2_Email_Design_Email_Content);
+          const val = String(emailHtml);
           payload.Email_Design = val.length > maxLen ? val.slice(0, maxLen) : val;
         }
-        payload.Logo_Graphic_Email_String = viewRow.GEN_Business_Units_Logo_Graphic_Email_String || null;
-        payload.Units_DBA = viewRow.GEN_Business_Units_DBA || null;
-        payload.Sessions_Title = viewRow.BAR2_Sessions_Title || payload.Sessions_Title || null;
-        payload.Event_Email_Preheader = viewRow.GEN_Business_Units_Event_Email_Preheader || null;
-        payload.Primary_Color_1 = viewRow.GEN_Business_Units_Primary_Color_1 || null;
-        payload.Primary_Color_2 = viewRow.GEN_Business_Units_Primary_Color_2 || null;
-        payload.Facility = viewRow.GEN_Business_Units_Facility || null;
+
+        payload.Logo_Graphic_Email_String = pickFirst(viewRow, [
+          "GEN_Business_Units_Logo_Graphic_Email_String",
+          "Logo_Graphic_Email_String",
+          "LogoEmailString",
+        ]);
+
+        payload.Units_DBA = pickFirst(viewRow, ["GEN_Business_Units_DBA", "Units_DBA", "DBA"]);
+
+        payload.Sessions_Title =
+          pickFirst(viewRow, ["BAR2_Sessions_Title", "Sessions_Title"]) || payload.Sessions_Title || null;
+
+        payload.Event_Email_Preheader = pickFirst(viewRow, [
+          "GEN_Business_Units_Event_Email_Preheader",
+          "Event_Email_Preheader",
+        ]);
+
+        payload.Primary_Color_1 = pickFirst(viewRow, ["GEN_Business_Units_Primary_Color_1", "Primary_Color_1"]);
+        payload.Primary_Color_2 = pickFirst(viewRow, ["GEN_Business_Units_Primary_Color_2", "Primary_Color_2"]);
+        payload.Facility = pickFirst(viewRow, ["GEN_Business_Units_Facility", "Facility"]);
+
+        console.log("ENRICHMENT_EMAIL_DESIGN_LEN:", payload.Email_Design ? String(payload.Email_Design).length : 0);
       }
 
       await updateReservationResilient(where, payload);
@@ -283,11 +336,14 @@ export default async function handler(req, res) {
       // ✅ Gate: ONLY log off-session charge tool payments
       const source = String(pi?.metadata?.source || "").toLowerCase();
       if (source !== "off_session" && source !== "off-session") {
+        console.log("PI_SUCCEEDED_SKIPPED_SOURCE:", source || "(missing)");
         return res.status(200).json({ received: true, skipped: "not_off_session" });
       }
 
       const idkey = getIdKeyFromMetadata(pi?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
+
+      console.log("PI_SUCCEEDED_OFFSESSION_IDKEY:", String(idkey));
 
       const piFull = await stripe.paymentIntents.retrieve(pi.id, {
         expand: ["payment_method", "charges.data.payment_method_details"],
@@ -381,6 +437,8 @@ export default async function handler(req, res) {
       // Prefer PI metadata, fall back to refund.metadata (more robust)
       const idkey = getIdKeyFromMetadata(pi?.metadata) || getIdKeyFromMetadata(refund?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
+
+      console.log("REFUND_EVENT_IDKEY:", String(idkey), "REFUND_ID:", refund?.id);
 
       const amountDollars = dollarsFromCents(refund?.amount ?? null);
       const currency = refund?.currency?.toLowerCase() || "usd";
