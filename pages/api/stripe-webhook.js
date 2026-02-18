@@ -205,6 +205,10 @@ export default async function handler(req, res) {
           viewRow.GEN_Business_Units_Primary_Color_2 || null;
 
         payload.Facility = viewRow.GEN_Business_Units_Facility || null;
+
+        // ✅ CHANGE #1: sync Session_Start_Date_Time from billing view
+        payload.Session_Start_Date_Time =
+          viewRow.BAR2_Sessions_Date_Start_Time || payload.Session_Start_Date_Time || null;
       }
 
       await updateReservationResilient(where, payload);
@@ -264,6 +268,18 @@ export default async function handler(req, res) {
       // IMPORTANT: your charge-tool MUST set metadata.IDKEY for this to link
       const idkey = getIdKeyFromMetadata(pi?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
+
+      // ✅ CHANGE #2: sync Session_Start_Date_Time from billing view (non-blocking)
+      try {
+        const viewRow = await getResBillingEditViewRowByIdKey(idkey);
+        const dt = viewRow?.BAR2_Sessions_Date_Start_Time || null;
+        if (dt) {
+          const where = `IDKEY='${escapeWhereValue(idkey)}'`;
+          await updateReservationResilient(where, { Session_Start_Date_Time: dt });
+        }
+      } catch (e) {
+        console.warn("⚠️ Session_Start_Date_Time sync failed (non-blocking)", e?.message);
+      }
 
       // Expand for card + charge id
       const piFull = await stripe.paymentIntents.retrieve(pi.id, {
