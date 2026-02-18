@@ -1,3 +1,5 @@
+// pages/api/stripe-webhook.js
+
 import Stripe from "stripe";
 import {
   updateReservationByWhere,
@@ -21,10 +23,6 @@ async function buffer(readable) {
 
 function escapeWhereValue(v) {
   return String(v ?? "").replaceAll("'", "''");
-}
-
-function oneLine(s) {
-  return String(s || "").replace(/\s+/g, " ").trim();
 }
 
 function dollarsFromCents(cents) {
@@ -62,10 +60,6 @@ async function updateReservationResilient(where, payload) {
 
 function getIdKeyFromMetadata(meta) {
   return meta?.IDKEY || meta?.reservation_id || meta?.idkey || meta?.IdKey || null;
-}
-
-function getResIdFromMetadata(meta) {
-  return meta?.RES_ID || meta?.res_id || meta?.Res_ID || null;
 }
 
 // Safely read Confirmation_Number from reservation row
@@ -158,7 +152,9 @@ export default async function handler(req, res) {
       const charge = paymentIntent?.charges?.data?.[0];
       const card =
         charge?.payment_method_details?.card ||
-        (typeof paymentIntent?.payment_method !== "string" ? paymentIntent?.payment_method?.card : null);
+        (typeof paymentIntent?.payment_method !== "string"
+          ? paymentIntent?.payment_method?.card
+          : null);
 
       const amountDollars = dollarsFromCents(paymentIntent?.amount_received ?? paymentIntent?.amount ?? null);
       const currency = paymentIntent?.currency?.toLowerCase() || "usd";
@@ -185,7 +181,7 @@ export default async function handler(req, res) {
         console.warn("⚠️ VIEW_LOOKUP_FAILED (non-blocking)", e?.message || e);
       }
 
-      // Reservation update payload (keep your existing behavior)
+      // Reservation update payload
       const payload = {
         BookingFeePaidAt: paidAtIso,
         StripeCheckoutSessionId: fullSession.id,
@@ -234,7 +230,7 @@ export default async function handler(req, res) {
         amountDollars
       );
 
-      // Transaction insert (now includes components + confirmation)
+      // Transaction insert (components + confirmation)
       let reservationChargeType = metaChargeType;
       if (!reservationChargeType) reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
 
@@ -258,7 +254,7 @@ export default async function handler(req, res) {
         StripeCustomerId: stripeCustomerId,
         StripePaymentMethodId: stripePaymentMethodId,
 
-        RES_ID: getResIdFromMetadata(session?.metadata) || getResIdFromMetadata(paymentIntent?.metadata) || null,
+        // NOTE: NO RES_ID stored in transaction table
         Charge_Type: reservationChargeType,
         Description: reservationChargeType,
 
@@ -382,14 +378,15 @@ export default async function handler(req, res) {
         pi = await stripe.paymentIntents.retrieve(paymentIntentId).catch(() => null);
       }
 
-      const idkey = getIdKeyFromMetadata(pi?.metadata);
+      // Prefer PI metadata, fall back to refund.metadata (more robust)
+      const idkey = getIdKeyFromMetadata(pi?.metadata) || getIdKeyFromMetadata(refund?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
 
       const amountDollars = dollarsFromCents(refund?.amount ?? null);
       const currency = refund?.currency?.toLowerCase() || "usd";
       const createdIso = new Date((refund?.created || Math.floor(Date.now() / 1000)) * 1000).toISOString();
 
-      const chargeType = pi?.metadata?.Charge_Type || "refund";
+      const chargeType = pi?.metadata?.Charge_Type || refund?.metadata?.Charge_Type || "refund";
       const description = `Refund - ${chargeType}`;
 
       // Confirmation_Number
