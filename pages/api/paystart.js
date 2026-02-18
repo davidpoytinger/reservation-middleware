@@ -25,19 +25,35 @@ function oneLine(s) {
 function shortHash(input) {
   const s = String(input || "");
   let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return h.toString(16);
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(16).slice(0, 12);
+}
+
+// Keep idempotency keys ASCII + <=255 chars.
+function idemKeyForCheckout({ idkey, amountCents, resId }) {
+  const base = `paystart|${idkey}|${resId || ""}|${amountCents}`;
+  return `paystart_${shortHash(base)}`.slice(0, 255);
+}
+
+function setCors(res, origin) {
+  const allowed = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
+  const allowOrigin = origin && origin === allowed ? origin : allowed;
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "GET") return res.status(405).send("Method not allowed");
+  setCors(res, req.headers.origin);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
 
   try {
-    if (!process.env.STRIPE_SECRET_KEY) return res.status(500).send("Missing STRIPE_SECRET_KEY");
-    if (!process.env.SITE_BASE_URL) return res.status(500).send("Missing SITE_BASE_URL");
-    if (!process.env.CASPIO_TABLE) return res.status(500).send("Missing CASPIO_TABLE");
-
-    const idkey = req.query.idkey || req.query.IDKEY || req.query.IdKey;
+    const idkey = oneLine(req.query.idkey);
     if (!idkey) return res.status(400).send("Missing idkey");
 
     // 1) Pull reservation data
@@ -45,6 +61,34 @@ export default async function handler(req, res) {
 
     const customerEmail = oneLine(reservation.Email);
     const bookingFeeAmount = Number(reservation.BookingFeeAmount);
+
+    // ---- 4-part charge breakdown (Base / Auto Gratuity / Tax / Fee) ----
+    // Optional query params:
+    //   base_amount, auto_gratuity, tax_amount, fee_amount  (all in dollars)
+    // If none provided, defaults to Fee-only = BookingFeeAmount.
+    function num2(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
+    }
+
+    const q = req.query || {};
+    let baseAmt = num2(q.base_amount);
+    let gratAmt = num2(q.auto_gratuity);
+    let taxAmt = num2(q.tax_amount);
+    let feeAmt = num2(q.fee_amount);
+
+    const anyBreakdown = baseAmt != null || gratAmt != null || taxAmt != null || feeAmt != null;
+
+    if (!anyBreakdown) {
+      baseAmt = 0;
+      gratAmt = 0;
+      taxAmt = 0;
+      feeAmt = Number(bookingFeeAmount);
+    }
+
+    const totalChargeAmount = Number(
+      ((baseAmt ?? 0) + (gratAmt ?? 0) + (taxAmt ?? 0) + (feeAmt ?? 0)).toFixed(2)
+    );
 
     const sessionsTitle = oneLine(reservation.Sessions_Title);
     const peopleText = oneLine(reservation.People_Text);
@@ -60,11 +104,11 @@ export default async function handler(req, res) {
     const resId = oneLine(resIdRaw);
 
     if (!customerEmail) return res.status(400).send("Missing Email on reservation");
-    if (!bookingFeeAmount || bookingFeeAmount <= 0) {
-      return res.status(400).send("Missing/invalid BookingFeeAmount on reservation");
+    if (!totalChargeAmount || totalChargeAmount <= 0) {
+      return res.status(400).send("Missing/invalid charge amount (breakdown or BookingFeeAmount)");
     }
 
-    const unitAmount = Math.round(bookingFeeAmount * 100);
+    const unitAmount = Math.round(totalChargeAmount * 100);
     const displayChargeType = chargeTypeRaw || "Booking Fee";
     const belowAmountText = [sessionsTitle, peopleText].filter(Boolean).join("  |  ").slice(0, 500);
 
@@ -76,40 +120,25 @@ export default async function handler(req, res) {
       Charge_Type: displayChargeType,
       Sessions_Title: sessionsTitle || "",
       People_Text: peopleText || "",
+
+      // 4-part breakdown for webhook -> SIGMA_BAR3_Transactions
+      base_amount: String(baseAmt ?? 0),
+      grat_amount: String(gratAmt ?? 0),
+      tax_amount: String(taxAmt ?? 0),
+      fee_amount: String(feeAmt ?? 0),
+      total_amount: String(totalChargeAmount),
     };
 
-    const idemKey = [
-      "RES",
-      String(idkey),
-      unitAmount,
-      shortHash(displayChargeType),
-      shortHash(belowAmountText),
-      shortHash(resId || ""),
-    ].join("_");
+    const idemKey = idemKeyForCheckout({
+      idkey,
+      amountCents: unitAmount,
+      resId,
+    });
 
-    const base = String(process.env.SITE_BASE_URL).replace(/\/+$/, "");
-    const encodedIdKey = encodeURIComponent(idkey);
-
-    const successUrl =
-      `${base}/barresv5custmanage.html?idkey=${encodedIdKey}` +
-      (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
-
-    const cancelUrl =
-      `${base}/barresv5cancelled.html?idkey=${encodedIdKey}` +
-      (resId ? `&res_id=${encodeURIComponent(resId)}` : "");
-
-    // 2) Ensure we have a Stripe Customer
-    // Prefer existing saved value from Caspio if present
-    let stripeCustomerId =
-      reservation?.StripeCustomerId ||
-      reservation?.Stripe_Customer_ID ||
-      reservation?.stripeCustomerId ||
-      null;
-
+    // 2) Ensure Stripe Customer exists
+    let stripeCustomerId = oneLine(reservation.StripeCustomerId);
     if (!stripeCustomerId) {
-      // Create a customer (idempotent-ish by using a deterministic key)
-      // Stripe doesn't support true idempotency on customers by email, but this is fine operationally.
-      const cust = await stripe.customers.create({
+      const customer = await stripe.customers.create({
         email: customerEmail,
         metadata: {
           IDKEY: String(idkey),
@@ -117,43 +146,44 @@ export default async function handler(req, res) {
         },
       });
 
-      stripeCustomerId = cust.id;
+      stripeCustomerId = customer.id;
 
-      // Write back so future flows have cus_...
-      try {
-        const where = buildWhereForIdKey(idkey);
-        await updateReservationByWhere(where, { StripeCustomerId: stripeCustomerId });
-      } catch (e) {
-        console.warn("Caspio StripeCustomerId writeback skipped/failed:", e?.message || e);
-      }
+      // Save StripeCustomerId back to Caspio (resilient)
+      const where = buildWhereForIdKey(idkey);
+      await updateReservationByWhere(where, {
+        StripeCustomerId: stripeCustomerId,
+        UpdatedAt: new Date().toISOString(),
+      }).catch(() => {});
     }
 
-    // 3) Create Checkout Session (idempotent)
+    // 3) Create Checkout Session
+    const allowedOrigin = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
+    const successUrl = `${allowedOrigin}/after.html?idkey=${encodeURIComponent(idkey)}&res_id=${encodeURIComponent(
+      resId || ""
+    )}`;
+    const cancelUrl = `${allowedOrigin}/cancel.html?idkey=${encodeURIComponent(idkey)}&res_id=${encodeURIComponent(
+      resId || ""
+    )}`;
+
     const session = await stripe.checkout.sessions.create(
       {
         mode: "payment",
-
-        // ✅ Use the customer so the payment method can attach and be reused off-session
         customer: stripeCustomerId,
-
-        // Helpful for dashboard / recovery
-        client_reference_id: String(idkey),
 
         line_items: [
           {
-            quantity: 1,
             price_data: {
               currency: "usd",
               product_data: {
                 name: displayChargeType,
-                description: belowAmountText,
+                description: belowAmountText || undefined,
               },
               unit_amount: unitAmount,
             },
+            quantity: 1,
           },
         ],
 
-        // ✅ This is what makes the payment method reusable later
         payment_intent_data: {
           setup_future_usage: "off_session",
           metadata: sharedMetadata,
@@ -166,71 +196,18 @@ export default async function handler(req, res) {
       { idempotencyKey: idemKey }
     );
 
-    // 4) Optional "pending" writeback
-    try {
-      const where = buildWhereForIdKey(idkey);
-      await updateReservationByWhere(where, {
-        PaymentStatus: "PendingBookingFee",
-        StripeCheckoutSessionId: session.id,
-        ...(resId ? { RES_ID: resId } : {}),
-      });
-    } catch (e) {
-      console.warn("Caspio pending writeback skipped/failed:", e?.message || e);
-    }
+    // Save StripeCheckoutSessionId + StripePaymentIntentId on reservation (best-effort)
+    const where = buildWhereForIdKey(idkey);
+    await updateReservationByWhere(where, {
+      StripeCheckoutSessionId: session?.id || null,
+      StripePaymentIntentId: session?.payment_intent || null,
+      UpdatedAt: new Date().toISOString(),
+    }).catch(() => {});
 
-    // 5) Redirect HTML
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "no-store");
-
-    return res.status(200).send(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Redirecting to secure payment…</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: #ffffff;
-    }
-    .box { text-align: center; padding: 24px; }
-    .title { font-size: 20px; font-weight: 600; }
-    .sub { margin-top: 8px; opacity: .7; }
-    .spinner {
-      width: 36px;
-      height: 36px;
-      margin: 20px auto 0;
-      border: 3px solid rgba(0,0,0,.15);
-      border-top-color: rgba(0,0,0,.6);
-      border-radius: 50%;
-      animation: spin .8s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
-</head>
-<body>
-  <div class="box">
-    <div class="title">Redirecting to secure payment…</div>
-    <div class="sub">This usually takes just a moment.</div>
-    <div class="spinner"></div>
-  </div>
-
-  <script>
-    setTimeout(function () {
-      window.location.replace(${JSON.stringify(session.url)});
-    }, 250);
-  </script>
-</body>
-</html>`);
+    // 4) Redirect user to Stripe Checkout
+    return res.redirect(303, session.url);
   } catch (err) {
-    console.error(err);
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Cache-Control", "no-store");
+    console.error("PAYSTART_FAILED", err?.message || err);
     return res.status(500).send(err?.message || "Server error");
   }
 }
