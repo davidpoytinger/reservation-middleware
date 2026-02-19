@@ -1,15 +1,18 @@
 // pages/api/sigma-rollup-total-res.js
-
-/**
- * Caspio Outgoing URL webhook -> roll up totals per RES_ID
- *
- * Auth: query string token (?token=...)
- *
- * IMPORTANT FIX:
- * - Caspio payload structure varies. This version finds RES_ID by:
- *    1) checking common Caspio fields
- *    2) deep-searching payload for a key named "RES_ID"
- */
+//
+// Caspio Outgoing URL webhook -> roll up totals per RES_ID
+//
+// Auth: query string token (?token=...)
+//
+// IMPORTANT FIX:
+// - Caspio payload structure varies. This version finds RES_ID by:
+//    1) checking common Caspio fields
+//    2) deep-searching payload for a key named "RES_ID"
+//
+// ✅ UPDATE (2026-02-19):
+// - Pulls GEN_Business_Units_Tax_Percentage and BAR2_Primary_Config_Auto_Gratuity_SIGMA
+//   from SIGMA_VW_Res_Billing_Edit by IDKEY
+// - Writes them to Tax_SIGMA and Auto_Gratuity_SIGMA in SIGMA_BAR3_TOTAL_RES
 
 const SOURCE_TABLE = "BAR2_Reservations_SIGMA";
 const ROLLUP_TABLE = "SIGMA_BAR3_TOTAL_RES";
@@ -20,6 +23,18 @@ const LINE_TOTAL_FIELD = "Total";
 
 const ROLLUP_KEY_FIELD = "RES_ID";
 const TOTAL_FIELD = "Total";
+
+// --- Billing view enrichment (by IDKEY) ---
+const BILLING_VIEW = "SIGMA_VW_Res_Billing_Edit";
+const BILLING_VIEW_KEY_FIELD = "IDKEY";
+
+// View fields to pull
+const V_TAX_PCT = "GEN_Business_Units_Tax_Percentage";
+const V_AUTO_GRAT = "BAR2_Primary_Config_Auto_Gratuity_SIGMA";
+
+// Rollup table fields to write
+const ROLLUP_TAX_FIELD = "Tax_SIGMA";
+const ROLLUP_AUTO_GRAT_FIELD = "Auto_Gratuity_SIGMA";
 
 // Storm guard
 const INFLIGHT_BY_RESID = new Map();
@@ -256,6 +271,23 @@ async function getRollupRow(resId) {
   return (resp?.Result || [])[0] || null;
 }
 
+// ✅ NEW: Billing view lookup by IDKEY (fast select)
+async function getBillingViewRowByIdKey(idkey) {
+  if (!idkey) return null;
+
+  const where = `${BILLING_VIEW_KEY_FIELD}='${escWhereValue(idkey)}'`;
+  const select = [BILLING_VIEW_KEY_FIELD, V_TAX_PCT, V_AUTO_GRAT].join(",");
+
+  const url =
+    `/rest/v2/views/${BILLING_VIEW}/records` +
+    `?q.where=${encodeURIComponent(where)}` +
+    `&q.limit=1` +
+    `&q.select=${encodeURIComponent(select)}`;
+
+  const resp = await caspioFetch(url);
+  return (resp?.Result || [])[0] || null;
+}
+
 // ---------- handler ----------
 export default async function handler(req, res) {
   try {
@@ -362,6 +394,19 @@ export default async function handler(req, res) {
       const Subtotal_Addon = addonRows.reduce((sum, r) => sum + toNum(r?.[LINE_TOTAL_FIELD]), 0);
       const Total = Subtotal_Primary + Subtotal_Addon;
 
+      // ✅ NEW: Pull from SIGMA_VW_Res_Billing_Edit by IDKEY
+      // Writes to: Tax_SIGMA, Auto_Gratuity_SIGMA (in rollup table)
+      let Tax_SIGMA = 0;
+      let Auto_Gratuity_SIGMA = 0;
+
+      if (IDKEY) {
+        const billingRow = await getBillingViewRowByIdKey(IDKEY).catch(() => null);
+        if (billingRow) {
+          Tax_SIGMA = toNum(billingRow?.[V_TAX_PCT]);
+          Auto_Gratuity_SIGMA = toNum(billingRow?.[V_AUTO_GRAT]);
+        }
+      }
+
       const upsertBody = {
         [ROLLUP_KEY_FIELD]: RES_ID,
         IDKEY,
@@ -370,6 +415,10 @@ export default async function handler(req, res) {
         Subtotal_Primary,
         Subtotal_Addon,
         Total,
+
+        // ✅ NEW FIELDS
+        [ROLLUP_TAX_FIELD]: Tax_SIGMA,
+        [ROLLUP_AUTO_GRAT_FIELD]: Auto_Gratuity_SIGMA,
       };
 
       if (existing) {
@@ -388,6 +437,8 @@ export default async function handler(req, res) {
             addonCount: addonRows.length,
             Subtotal_Primary,
             Subtotal_Addon,
+            [ROLLUP_TAX_FIELD]: Tax_SIGMA,
+            [ROLLUP_AUTO_GRAT_FIELD]: Auto_Gratuity_SIGMA,
             resIdPath: norm.resIdPath,
           },
         };
@@ -407,6 +458,8 @@ export default async function handler(req, res) {
             addonCount: addonRows.length,
             Subtotal_Primary,
             Subtotal_Addon,
+            [ROLLUP_TAX_FIELD]: Tax_SIGMA,
+            [ROLLUP_AUTO_GRAT_FIELD]: Auto_Gratuity_SIGMA,
             resIdPath: norm.resIdPath,
           },
         };
