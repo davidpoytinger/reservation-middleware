@@ -72,6 +72,11 @@ function pickIdKeyFromInsertResponse(insertJson) {
   return idkey ? String(idkey) : null;
 }
 
+function toFiniteNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 export default async function handler(req, res) {
   setCors(res, req.headers.origin);
 
@@ -88,6 +93,9 @@ export default async function handler(req, res) {
     const b = req.body || {};
 
     const RES_ID = oneLine(b.RES_ID) || genResId12();
+
+    // Tax_Rate: you said you added it as a number field (store RATE, e.g. 0.055)
+    const taxRate = toFiniteNumber(b.Tax_Rate);
 
     const payload = {
       Status: "In Process",
@@ -119,9 +127,13 @@ export default async function handler(req, res) {
 
       BookingFeeAmount: b.BookingFeeAmount,
 
-      // If your Caspio table now requires Tax_Rate, uncomment:
-      // Tax_Rate: b.Tax_Rate,
+      // ✅ NEW (now actually written):
+      Tax_Rate: taxRate,
     };
+
+    // If you want to allow missing Tax_Rate (not recommended), you can:
+    // - remove Tax_Rate from required[] below
+    // - and/or default here: Tax_Rate: taxRate ?? 0.055
 
     const required = [
       "Business_Unit",
@@ -138,6 +150,7 @@ export default async function handler(req, res) {
       "Email",
       "Phone_Number",
       "BookingFeeAmount",
+      "Tax_Rate", // ✅ now required
     ];
 
     for (const k of required) {
@@ -146,6 +159,9 @@ export default async function handler(req, res) {
 
     const fee = Number(payload.BookingFeeAmount);
     if (!Number.isFinite(fee) || fee <= 0) throw new Error("BookingFeeAmount must be > 0");
+
+    const tr = Number(payload.Tax_Rate);
+    if (!Number.isFinite(tr) || tr < 0) throw new Error("Tax_Rate must be a valid number >= 0");
 
     const insertJson = await insertRecord(table, payload);
 
