@@ -27,7 +27,20 @@ const SECRET = process.env.CHAT_STATE_SECRET || ""; // strongly recommended
 function json(res, code, obj) {
   res.status(code).setHeader("Content-Type", "application/json").end(JSON.stringify(obj));
 }
+function setCors(req, res) {
+  const origin = req.headers.origin || "*";
 
+  // If you don't use cookies/credentials, you can allow "*".
+  // Safer option: allow just your Weebly domains:
+  // const allow = new Set(["https://www.yoursite.com", "https://yoursite.weebly.com"]);
+  // const useOrigin = allow.has(origin) ? origin : "https://www.yoursite.com";
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
 function oneLine(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
@@ -289,6 +302,11 @@ function defaultState() {
 }
 
 export default async function handler(req, res) {
+  setCors(req, res);
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
   // Simple GET health check
   if (req.method === "GET") {
     return json(res, 200, { ok: true, route: "chat-reserve", stateless: true });
