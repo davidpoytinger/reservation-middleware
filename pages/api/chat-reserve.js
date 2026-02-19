@@ -1,27 +1,39 @@
 // pages/api/chat-reserve.js
 //
-// Stateless-ish reservation chatbot endpoint.
-// The "AI" portion is intentionally lightweight: we parse intents,
-// then we force the user through the same deterministic steps as SIGMA.
-//
-// Uses existing routes:
-//   GET  /api/sessions?date=YYYY-MM-DD&bu=optional
-//   GET  /api/pricing?price_status=...
-//   POST /api/reserve
-//
-// Then returns a paystart redirect URL.
+// Hybrid “translator + concierge” chat endpoint:
+// - NO OpenAI key required
+// - Deterministic: calls your existing /api/sessions, /api/pricing, /api/reserve, /api/paystart
+// - Always returns { ok:true, reply:string, choices:[] } so UI never renders "undefined"
 
 import crypto from "crypto";
 
-const BASE = "https://reservation-middleware2.vercel.app"; // or process.env.MIDDLEWARE_BASE
-const SESSIONS_URL = `${BASE}/api/sessions`;
-const PRICING_URL = `${BASE}/api/pricing`;
-const RESERVE_URL = `${BASE}/api/reserve`;
-const PAYSTART_URL = `${BASE}/api/paystart`;
-
-// In-memory thread store (fine for v1; can swap later)
+// In-memory thread store (fine for v1 on serverless; resets across cold starts)
 const THREADS = globalThis.__SIGMA_CHAT_THREADS__ || new Map();
 globalThis.__SIGMA_CHAT_THREADS__ = THREADS;
+
+// ---- CORS ----
+function setCors(res, origin) {
+  const envAllowed = String(process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const allowed = new Set([
+    "https://www.reservebarsandrec.com",
+    "https://reservebarsandrec.com",
+    ...envAllowed,
+  ]);
+
+  let allowOrigin;
+  if (!origin || origin === "null") allowOrigin = "*";
+  else if (allowed.has(origin)) allowOrigin = origin;
+  else allowOrigin = "https://www.reservebarsandrec.com";
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+}
 
 function json(res, code, obj) {
   res.status(code).setHeader("Content-Type", "application/json").end(JSON.stringify(obj));
@@ -29,6 +41,10 @@ function json(res, code, obj) {
 
 function oneLine(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeBU(s) {
+  return String(s || "").trim().toUpperCase().replace(/[^A-Z0-9_]/g, "");
 }
 
 function todayISO() {
@@ -46,10 +62,6 @@ function addDaysISO(iso, add) {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
-}
-
-function normalizeBU(s) {
-  return String(s || "").trim().toUpperCase().replace(/[^A-Z0-9_]/g, "");
 }
 
 function parseTaxPercentToRate(val, fallback = 0.055) {
@@ -93,16 +105,27 @@ function setThread(threadId, data) {
   THREADS.set(threadId, data);
 }
 
+// Build absolute base URL for internal same-app calls (no hardcoding)
+function baseFromReq(req) {
+  const proto = (req.headers["x-forwarded-proto"] || "https").toString();
+  const host = (req.headers["x-forwarded-host"] || req.headers.host || "").toString();
+  return `${proto}://${host}`;
+}
+
 async function fetchJSON(url, opts = {}) {
   const r = await fetch(url, { ...opts, cache: "no-store" });
   const text = await r.text();
   let j = {};
-  try { j = text ? JSON.parse(text) : {}; } catch {}
+  try {
+    j = text ? JSON.parse(text) : {};
+  } catch {
+    j = {};
+  }
   if (!r.ok) throw new Error(j?.error || j?.Message || text || `HTTP ${r.status}`);
   return j;
 }
 
-// ---- Caspio view field names (match your booking UI) ----
+// ---- Caspio view field names (match your UI) ----
 const V_DATE = "BAR2_Sessions_Date";
 const V_BU = "BAR2_Sessions_Business_Unit";
 const V_DBA = "GEN_Business_Units_DBA";
@@ -122,8 +145,7 @@ function isSoldOut(row) {
   return Number.isFinite(n) ? n === 0 : false;
 }
 
-// ---- Lightweight parsing helpers (v1) ----
-// We keep parsing minimal. Any ambiguity -> we ask, then present buttons.
+// ---- Minimal free-text parsing (buttons do most work) ----
 function parseChargeType(text) {
   const t = String(text || "").toLowerCase();
   if (t.includes("pay now") || t.includes("pay full") || t.includes("paid")) return "Pay Now";
@@ -136,11 +158,8 @@ function parseDate(text) {
   const today = todayISO();
   if (t.includes("today")) return today;
   if (t.includes("tomorrow")) return addDaysISO(today, 1);
-
-  // ISO in message
   const m = t.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-
   return "";
 }
 
@@ -157,7 +176,6 @@ function parsePhone(text) {
 
 function parseName(text) {
   const t = oneLine(text);
-  // naive: "I'm First Last" or "First Last"
   const m = t.match(/(?:i am|i'm|this is)?\s*([A-Za-z'-]{2,})\s+([A-Za-z'-]{2,})/i);
   if (!m) return { first: "", last: "" };
   return { first: m[1], last: m[2] };
@@ -187,7 +205,6 @@ function computeAmounts({ units, unitPrice, taxRate, autoGratRaw, chargeType, bo
 }
 
 function stepName(state) {
-  // Determine what we need next
   if (!state.date) return "date";
   if (!state.bu) return "business";
   if (!state.type) return "type";
@@ -212,26 +229,39 @@ function summarize(state) {
 }
 
 export default async function handler(req, res) {
+  setCors(res, req.headers.origin);
+
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "GET") {
+    return json(res, 200, { ok: true, route: "chat-reserve" });
+  }
   if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed" });
+
+  const BASE = baseFromReq(req);
+  const SESSIONS_URL = `${BASE}/api/sessions`;
+  const PRICING_URL = `${BASE}/api/pricing`;
+  const RESERVE_URL = `${BASE}/api/reserve`;
+  const PAYSTART_URL = `${BASE}/api/paystart`;
 
   try {
     const body = req.body || {};
     const message = oneLine(body.message);
-    const action = oneLine(body.action); // optional: button actions
+    let action = body.action; // may be JSON string
     let threadId = oneLine(body.threadId);
 
-    // Create new thread if needed
+    // Create thread if needed
     if (!threadId) {
       threadId = makeThreadId();
       setThread(threadId, {
         threadId,
         createdAt: Date.now(),
-        // booking state
+
         date: "",
-        bu: "",      // Business_Unit code
-        dba: "",     // display label
-        type: "",    // experience (Primary_Name)
-        time: "",    // start time string
+        bu: "",
+        dba: "",
+
+        type: "",
+        time: "",
         sessionId: "",
         priceStatus: "",
         priceClass: "",
@@ -240,16 +270,15 @@ export default async function handler(req, res) {
         autoGratRaw: 0,
         taxRate: 0.055,
 
-        // package selection
-        package: "",       // key
+        package: "",
         packageLabel: "",
         units: "",
         cQuant: "",
         unitPrice: 0,
 
-        // payment + contact
         chargeType: "",
         policyAgreed: false,
+
         first: "",
         last: "",
         email: "",
@@ -261,8 +290,7 @@ export default async function handler(req, res) {
     const state = getThread(threadId);
     if (!state) throw new Error("Thread not found");
 
-    // ---- Apply quick parses from free-text message ----
-    // Also allow setting fields through button actions (preferred).
+    // quick parse free-text
     if (message) {
       const dt = parseDate(message);
       if (dt) state.date = dt;
@@ -277,36 +305,74 @@ export default async function handler(req, res) {
       if (ph) state.phone = ph;
 
       const nm = parseName(message);
-      if (nm.first && nm.last) { state.first = nm.first; state.last = nm.last; }
+      if (nm.first && nm.last) {
+        state.first = nm.first;
+        state.last = nm.last;
+      }
 
       if (message.toLowerCase().includes("agree")) state.policyAgreed = true;
     }
 
-    // ---- Handle structured button actions ----
-    // action examples:
-    //  { kind:"pickBusiness", bu:"NORTHSOUTH", dba:"NorthSouth Club" }
-    //  { kind:"pickType", type:"Deck Curling" }
-    //  { kind:"pickTime", sessionId:"...", time:"6:00 PM", priceStatus:"..." }
-    //  { kind:"pickPackage", units:"8", unitPrice:"35", cQuant:"...", label:"8 People" }
-    //  { kind:"setChargeType", chargeType:"Pay Now" }
-    //  { kind:"agreePolicy" }
+    // Parse structured actions
     let act = null;
-    try { act = typeof action === "string" ? JSON.parse(action) : action; } catch { act = null; }
+    try {
+      act = typeof action === "string" ? JSON.parse(action) : action;
+    } catch {
+      act = null;
+    }
+
+    const resetDownstreamFromBusiness = () => {
+      state.type = "";
+      state.time = "";
+      state.sessionId = "";
+      state.priceStatus = "";
+      state.priceClass = "";
+      state.sessionsTitle = "";
+      state.bookingFee = 0;
+      state.autoGratRaw = 0;
+      state.taxRate = 0.055;
+
+      state.package = "";
+      state.packageLabel = "";
+      state.units = "";
+      state.cQuant = "";
+      state.unitPrice = 0;
+    };
+
+    const resetDownstreamFromType = () => {
+      state.time = "";
+      state.sessionId = "";
+      state.priceStatus = "";
+      state.priceClass = "";
+      state.sessionsTitle = "";
+      state.bookingFee = 0;
+      state.autoGratRaw = 0;
+      state.taxRate = 0.055;
+
+      state.package = "";
+      state.packageLabel = "";
+      state.units = "";
+      state.cQuant = "";
+      state.unitPrice = 0;
+    };
+
+    const resetDownstreamFromTime = () => {
+      state.package = "";
+      state.packageLabel = "";
+      state.units = "";
+      state.cQuant = "";
+      state.unitPrice = 0;
+    };
 
     if (act?.kind === "pickBusiness") {
       state.bu = normalizeBU(act.bu);
       state.dba = oneLine(act.dba);
-      // reset downstream
-      state.type = ""; state.time = ""; state.sessionId = ""; state.priceStatus = "";
-      state.package = ""; state.packageLabel = ""; state.units = ""; state.cQuant = ""; state.unitPrice = 0;
+      resetDownstreamFromBusiness();
     }
-
     if (act?.kind === "pickType") {
       state.type = oneLine(act.type);
-      state.time = ""; state.sessionId = ""; state.priceStatus = "";
-      state.package = ""; state.packageLabel = ""; state.units = ""; state.cQuant = ""; state.unitPrice = 0;
+      resetDownstreamFromType();
     }
-
     if (act?.kind === "pickTime") {
       state.time = oneLine(act.time);
       state.sessionId = oneLine(act.sessionId);
@@ -316,9 +382,8 @@ export default async function handler(req, res) {
       state.bookingFee = Number(act.bookingFee || 0) || 0;
       state.autoGratRaw = act.autoGratRaw ?? 0;
       state.taxRate = parseTaxPercentToRate(act.taxPct, 0.055);
-      state.package = ""; state.packageLabel = ""; state.units = ""; state.cQuant = ""; state.unitPrice = 0;
+      resetDownstreamFromTime();
     }
-
     if (act?.kind === "pickPackage") {
       state.package = oneLine(act.key || `${act.cQuant}|${act.units}|${act.unitPrice}`);
       state.packageLabel = oneLine(act.label);
@@ -326,33 +391,52 @@ export default async function handler(req, res) {
       state.cQuant = oneLine(act.cQuant);
       state.unitPrice = Number(act.unitPrice || 0) || 0;
     }
-
     if (act?.kind === "setChargeType") state.chargeType = oneLine(act.chargeType);
     if (act?.kind === "agreePolicy") state.policyAgreed = true;
     if (act?.kind === "setNotes") state.notes = oneLine(act.notes);
 
-    // ---- Now drive next step ----
-    const next = stepName(state);
-    let reply = "";
-    let choices = [];
+    // Ensure saved
+    setThread(threadId, state);
 
-    // Helper: build choice buttons
+    // Helpers for response shape (prevents undefined)
+    const respond = ({ reply = "", choices = [], next = "", extraState = null }) => {
+      return json(res, 200, {
+        ok: true,
+        threadId,
+        reply: String(reply ?? "OK"),
+        choices: Array.isArray(choices) ? choices : [],
+        next: String(next || ""),
+        state: extraState ? extraState : { ...state },
+      });
+    };
+
     const btn = (label, actionObj) => ({ label, action: JSON.stringify(actionObj) });
 
-    // Step: date
-    if (next === "date") {
-      reply =
-        "What date are you booking for? You can say “today”, “tomorrow”, or type YYYY-MM-DD.";
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+    const next = stepName(state);
+
+    // 0) If user just opened chat (empty message/action), start properly
+    if (!message && !act) {
+      return respond({
+        reply: "Hi! I can book your reservation. What date are you looking for? (Say “today”, “tomorrow”, or YYYY-MM-DD.)",
+        choices: [],
+        next: "date",
+      });
     }
 
-    // Step: business (show businesses from sessions endpoint)
+    // 1) DATE
+    if (next === "date") {
+      return respond({
+        reply: "What date are you booking for? You can say “today”, “tomorrow”, or type YYYY-MM-DD.",
+        choices: [],
+        next,
+      });
+    }
+
+    // 2) BUSINESS
     if (next === "business") {
       const sess = await fetchJSON(`${SESSIONS_URL}?date=${encodeURIComponent(state.date)}`);
       const rows = sess?.rows || [];
 
-      // unique bu+dba pairs
       const map = new Map();
       for (const r of rows) {
         const bu = oneLine(r?.[V_BU]);
@@ -360,25 +444,23 @@ export default async function handler(req, res) {
         if (bu && dba && !map.has(bu)) map.set(bu, dba);
       }
 
-      const list = Array.from(map.entries()).map(([bu, dba]) => ({ bu, dba }))
+      const list = Array.from(map.entries())
+        .map(([bu, dba]) => ({ bu, dba }))
         .sort((a, b) => a.dba.localeCompare(b.dba));
 
-      reply = `Got it — ${state.date}. Which location/business?`;
-      choices = list.slice(0, 12).map((x) =>
-        btn(x.dba, { kind: "pickBusiness", bu: x.bu, dba: x.dba })
-      );
-
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+      return respond({
+        reply: `Got it — ${state.date}. Which location/business?`,
+        choices: list.slice(0, 12).map((x) => btn(x.dba, { kind: "pickBusiness", bu: x.bu, dba: x.dba })),
+        next,
+      });
     }
 
-    // Step: type (experience)
+    // 3) TYPE
     if (next === "type") {
       const bu = state.bu ? `&bu=${encodeURIComponent(state.bu)}` : "";
       const sess = await fetchJSON(`${SESSIONS_URL}?date=${encodeURIComponent(state.date)}${bu}`);
       const rows = (sess?.rows || []).filter((r) => !isSoldOut(r));
 
-      // group by type
       const counts = new Map();
       for (const r of rows) {
         const type = oneLine(r?.[V_ITEM]);
@@ -390,23 +472,19 @@ export default async function handler(req, res) {
         .map(([type, count]) => ({ type, count }))
         .sort((a, b) => a.type.localeCompare(b.type));
 
-      reply = `Great — ${state.dba || state.bu}. What experience are you booking?`;
-      choices = types.slice(0, 12).map((t) =>
-        btn(`${t.type} (${t.count} times)`, { kind: "pickType", type: t.type })
-      );
-
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+      return respond({
+        reply: `Great — ${state.dba || state.bu}. What experience are you booking?`,
+        choices: types.slice(0, 12).map((t) => btn(`${t.type} (${t.count} times)`, { kind: "pickType", type: t.type })),
+        next,
+      });
     }
 
-    // Step: time
+    // 4) TIME
     if (next === "time") {
       const bu = state.bu ? `&bu=${encodeURIComponent(state.bu)}` : "";
       const sess = await fetchJSON(`${SESSIONS_URL}?date=${encodeURIComponent(state.date)}${bu}`);
-      const rows = (sess?.rows || [])
-        .filter((r) => oneLine(r?.[V_ITEM]) === state.type);
+      const rows = (sess?.rows || []).filter((r) => oneLine(r?.[V_ITEM]) === state.type);
 
-      // sort times (keep simple)
       const times = rows
         .map((r) => ({
           time: oneLine(r?.[V_START]),
@@ -419,14 +497,12 @@ export default async function handler(req, res) {
           taxPct: r?.[V_TAX_PCT],
           soldOut: isSoldOut(r),
         }))
-        .filter((x) => x.time && x.sessionId)
+        .filter((x) => x.time && x.sessionId && !x.soldOut)
         .sort((a, b) => a.time.localeCompare(b.time));
 
-      reply = `Which start time for **${state.type}** on ${state.date}?`;
-      choices = times
-        .filter((x) => !x.soldOut)
-        .slice(0, 14)
-        .map((x) =>
+      return respond({
+        reply: `Which start time for ${state.type} on ${state.date}?`,
+        choices: times.slice(0, 14).map((x) =>
           btn(x.time, {
             kind: "pickTime",
             time: x.time,
@@ -438,19 +514,16 @@ export default async function handler(req, res) {
             autoGratRaw: x.autoGratRaw,
             taxPct: x.taxPct,
           })
-        );
-
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+        ),
+        next,
+      });
     }
 
-    // Step: package (group size option)
+    // 5) PACKAGE
     if (next === "package") {
       const pr = await fetchJSON(`${PRICING_URL}?price_status=${encodeURIComponent(state.priceStatus)}`);
       const rows = pr?.rows || [];
 
-      // Your pricing view returns many rows (by Price_Status_Sub, C_Quant, Unit, Price)
-      // We'll present the common "Unit (people) + price" options.
       const options = rows
         .map((r) => ({
           label: oneLine(r.Description) || `${r.Unit} people`,
@@ -462,62 +535,54 @@ export default async function handler(req, res) {
         .filter((o) => o.units && o.cQuant && Number.isFinite(o.unitPrice))
         .sort((a, b) => Number(a.units) - Number(b.units));
 
-      reply = `How many people? Pick a group option:`;
-      choices = options.slice(0, 12).map((o) =>
-        btn(`${o.label} — ${money(o.unitPrice)} / person`, {
-          kind: "pickPackage",
-          key: o.key,
-          label: o.label,
-          units: o.units,
-          cQuant: o.cQuant,
-          unitPrice: o.unitPrice,
-        })
-      );
-
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+      return respond({
+        reply: "How many people? Pick a group option:",
+        choices: options.slice(0, 12).map((o) =>
+          btn(`${o.label} — ${money(o.unitPrice)} / person`, {
+            kind: "pickPackage",
+            key: o.key,
+            label: o.label,
+            units: o.units,
+            cQuant: o.cQuant,
+            unitPrice: o.unitPrice,
+          })
+        ),
+        next,
+      });
     }
 
-    // Step: charge type
+    // 6) CHARGE TYPE
     if (next === "chargeType") {
-      reply = `Payment choice?`;
-      choices = [
-        btn("24 Hour Hold Fee", { kind: "setChargeType", chargeType: "24 Hour Hold Fee" }),
-        btn("Pay Now", { kind: "setChargeType", chargeType: "Pay Now" }),
-      ];
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+      return respond({
+        reply: "Payment choice?",
+        choices: [
+          btn("24 Hour Hold Fee", { kind: "setChargeType", chargeType: "24 Hour Hold Fee" }),
+          btn("Pay Now", { kind: "setChargeType", chargeType: "Pay Now" }),
+        ],
+        next,
+      });
     }
 
-    // Step: policy
+    // 7) POLICY
     if (next === "policy") {
-      reply =
+      const policy =
         state.chargeType === "Pay Now"
-          ? "Pay Now policy: non-refundable after booking. Reply “I agree” to continue."
-          : "Hold Fee policy: cancel up to 24 hours prior without penalty. Reply “I agree” to continue.";
-      choices = [btn("I agree", { kind: "agreePolicy" })];
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+          ? "Pay Now policy: you pay today (base + tax + auto gratuity). Non-refundable after booking."
+          : "Hold Fee policy: you only pay the 24-hour hold fee today. You can cancel up to 24 hours prior without penalty.";
+
+      return respond({
+        reply: `${policy}\n\nReply “I agree” to continue.`,
+        choices: [btn("I agree", { kind: "agreePolicy" })],
+        next,
+      });
     }
 
-    // Step: name/email/phone (collect if missing)
-    if (next === "name") {
-      reply = "What’s your first and last name?";
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
-    }
-    if (next === "email") {
-      reply = "What email should we send the confirmation to?";
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
-    }
-    if (next === "phone") {
-      reply = "What’s the best phone number for the reservation?";
-      setThread(threadId, state);
-      return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
-    }
+    // 8) CONTACT
+    if (next === "name") return respond({ reply: "What’s your first and last name?", choices: [], next });
+    if (next === "email") return respond({ reply: "What email should we send the confirmation to?", choices: [], next });
+    if (next === "phone") return respond({ reply: "What’s the best phone number for the reservation?", choices: [], next });
 
-    // Step: confirm -> create reservation + return pay url
+    // 9) CONFIRM -> RESERVE -> PAYSTART LINK
     if (next === "confirm") {
       const amounts = computeAmounts({
         units: state.units,
@@ -530,7 +595,6 @@ export default async function handler(req, res) {
 
       if (!(amounts.dueToday > 0)) throw new Error("Due today must be > 0.");
 
-      // Build reserve body (same shape as your booking form)
       const peopleText = state.units ? `${state.units} people` : "";
 
       const reserveBody = {
@@ -570,7 +634,6 @@ export default async function handler(req, res) {
 
       const idkey = created.idkey;
 
-      // Pass breakdown to paystart (matches your booking UI behavior)
       const params = new URLSearchParams();
       params.set("idkey", idkey);
 
@@ -588,32 +651,25 @@ export default async function handler(req, res) {
 
       const payUrl = `${PAYSTART_URL}?${params.toString()}`;
 
-      reply =
-        `Perfect. Here’s what I’m booking:\n` +
-        `• ${summarize(state)}\n` +
-        `• Due today: ${money(amounts.dueToday)}\n\n` +
-        `Tap “Proceed to payment” to complete it.`;
-
-      choices = [
-        { label: "Proceed to payment", href: payUrl },
-      ];
-
-      setThread(threadId, state);
-      return json(res, 200, {
-        ok: true,
-        threadId,
-        reply,
-        choices,
+      return respond({
+        reply:
+          `Perfect. Here’s what I’m booking:\n` +
+          `• ${summarize(state)}\n` +
+          `• Due today: ${money(amounts.dueToday)}\n\n` +
+          `Tap “Proceed to payment” to complete it.`,
+        choices: [{ label: "Proceed to payment", href: payUrl }],
         next: "done",
-        state: { ...state, amounts, idkey },
+        extraState: { ...state, amounts, idkey },
       });
     }
 
-    // Fallback
-    reply = "Tell me what you’re trying to book (date, location, experience), and I’ll guide you.";
-    setThread(threadId, state);
-    return json(res, 200, { ok: true, threadId, reply, choices, next, state: { ...state } });
+    // Fallback (shouldn’t happen)
+    return respond({
+      reply: "Tell me what you’re trying to book (date, location, experience), and I’ll guide you.",
+      choices: [],
+      next: "date",
+    });
   } catch (err) {
-    return json(res, 200, { ok: false, error: String(err?.message || err) });
+    return json(res, 200, { ok: false, error: String(err?.message || err) || "Unknown error" });
   }
 }
