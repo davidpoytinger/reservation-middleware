@@ -5,22 +5,22 @@
  *
  * Auth: query string token (?token=...)
  *
- * IMPORTANT FIX (kept):
+ * IMPORTANT FIX:
  * - Caspio payload structure varies. This version finds RES_ID by:
  *    1) checking common Caspio fields
  *    2) deep-searching payload for a key named "RES_ID"
  *
- * ✅ ADDITIONS:
- * - Look up SIGMA_VW_Res_Billing_Edit by IDKEY (from the Reservation row)
- * - Write:
- *    Tax_SIGMA <- GEN_Business_Units_Tax_Percentage
- *    Auto_Gratuity_SIGMA <- BAR2_Primary_Config_Auto_Gratuity_SIGMA
- * - Move Stripe-webhook-style "enrichment mapping" into the rollup row (optional columns)
+ * ADDITIONS:
+ * - Enrichment moved here (from stripe-webhook):
+ *   - Lookup SIGMA_VW_Res_Billing_Edit by IDKEY
+ *   - Write email/branding fields to BAR2_Reservations_SIGMA
+ * - Also write Tax_SIGMA and Auto_Gratuity_SIGMA to SIGMA_BAR3_TOTAL_RES
+ *   based on fields from SIGMA_VW_Res_Billing_Edit
  */
 
 const SOURCE_TABLE = "BAR2_Reservations_SIGMA";
 const ROLLUP_TABLE = "SIGMA_BAR3_TOTAL_RES";
-const BILLING_VIEW = "SIGMA_VW_Res_Billing_Edit";
+const BILLING_VIEW = "SIGMA_VW_Res_Billing_Edit"; // ✅ uses IDKEY
 
 const RES_ID_FIELD = "RES_ID";
 const TYPE_FIELD = "Type";
@@ -29,45 +29,13 @@ const LINE_TOTAL_FIELD = "Total";
 const ROLLUP_KEY_FIELD = "RES_ID";
 const TOTAL_FIELD = "Total";
 
-// Rollup table additional targets
-const R_TAX_SIGMA = "Tax_SIGMA";
-const R_AUTO_GRAT_SIGMA = "Auto_Gratuity_SIGMA";
+// New rollup fields you want to populate:
+const ROLLUP_TAX_FIELD = "Tax_SIGMA";
+const ROLLUP_AUTOGRAT_FIELD = "Auto_Gratuity_SIGMA";
 
-// View fields to pull
+// Billing view source fields:
 const V_TAX_PCT = "GEN_Business_Units_Tax_Percentage";
 const V_AUTO_GRAT = "BAR2_Primary_Config_Auto_Gratuity_SIGMA";
-
-// Optional enrichment columns (same values your webhook used to write to BAR2_Reservations_SIGMA)
-// If these columns don't exist in SIGMA_BAR3_TOTAL_RES, we will auto-trim and still succeed.
-const R_EMAIL_DESIGN = "Email_Design";
-const R_LOGO = "Logo_Graphic_Email_String";
-const R_UNITS_DBA = "Units_DBA";
-const R_SESSIONS_TITLE = "Sessions_Title";
-const R_PREHEADER = "Event_Email_Preheader";
-const R_PCOLOR1 = "Primary_Color_1";
-const R_PCOLOR2 = "Primary_Color_2";
-const R_FACILITY = "Facility";
-
-// Keys in view row (alias drift tolerant)
-const EMAIL_HTML_KEYS = [
-  "BAR2_Email_Design_Email_Content",
-  "Email_Design_Email_Content",
-  "Email_Design",
-  "Email_Content",
-  "BAR2_Email_Design",
-  "EmailHTML",
-];
-const LOGO_KEYS = [
-  "GEN_Business_Units_Logo_Graphic_Email_String",
-  "Logo_Graphic_Email_String",
-  "LogoEmailString",
-];
-const DBA_KEYS = ["GEN_Business_Units_DBA", "Units_DBA", "DBA"];
-const SESS_TITLE_KEYS = ["BAR2_Sessions_Title", "Sessions_Title"];
-const PREHEADER_KEYS = ["GEN_Business_Units_Event_Email_Preheader", "Event_Email_Preheader"];
-const PC1_KEYS = ["GEN_Business_Units_Primary_Color_1", "Primary_Color_1"];
-const PC2_KEYS = ["GEN_Business_Units_Primary_Color_2", "Primary_Color_2"];
-const FACILITY_KEYS = ["GEN_Business_Units_Facility", "Facility"];
 
 // Storm guard
 const INFLIGHT_BY_RESID = new Map();
@@ -93,7 +61,7 @@ function setCached(resId, result) {
 
 // ---------- helpers ----------
 function escWhereValue(v) {
-  return String(v).replace(/'/g, "''");
+  return String(v ?? "").replace(/'/g, "''");
 }
 function toNum(x) {
   const n = Number(x);
@@ -235,32 +203,6 @@ function normalizeWebhook(payload) {
   };
 }
 
-function pickFirst(obj, keys) {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
-  }
-  return null;
-}
-
-function parseTaxPercentToRate(val) {
-  // Accepts: 0.055, 5.5, "5.5%", "0.055"
-  const raw = String(val ?? "").trim().replace("%", "");
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return null;
-
-  // If >1 assume percent (e.g. 5.5 => 0.055)
-  if (n > 1) return Number((n / 100).toFixed(6));
-  return Number(n.toFixed(6));
-}
-
-function parseAutoGrat(val) {
-  const raw = String(val ?? "").trim().replace("%", "");
-  const n = Number(raw);
-  // keep as numeric; interpretation (flat vs rate) is up to downstream usage
-  return Number.isFinite(n) ? n : null;
-}
-
 // ---------- Caspio REST helpers ----------
 let tokenCache = { token: null, exp: 0 };
 const nowSec = () => Math.floor(Date.now() / 1000);
@@ -294,9 +236,7 @@ async function getCaspioToken() {
 async function caspioFetch(path, { method = "GET", body } = {}) {
   const token = await getCaspioToken();
   const base = process.env.CASPIO_BASE_URL;
-
   const url = `${base}${path}`;
-  console.log("CASPIO_FETCH:", method, url);
 
   const resp = await fetch(url, {
     method,
@@ -310,14 +250,59 @@ async function caspioFetch(path, { method = "GET", body } = {}) {
 
   const text = await resp.text();
   if (!resp.ok) {
-    console.error("CASPIO_ERR:", method, url, resp.status, text);
     throw new Error(`Caspio ${method} failed ${resp.status}: ${text}`);
   }
 
   if (!text) return null;
-  try { return JSON.parse(text); } catch { return { raw: text }; }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
 }
 
+async function caspioWriteResilient(path, method, bodyObj) {
+  try {
+    return await caspioFetch(path, { method, body: bodyObj });
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (!/ColumnNotFound/i.test(msg) && !/do not exist/i.test(msg)) throw err;
+
+    // Parse "...field(s) do not exist: 'A', 'B'..."
+    const missing = [];
+    for (const m of msg.matchAll(/'([^']+)'/g)) missing.push(m[1]);
+    if (!missing.length) throw err;
+
+    const trimmed = { ...bodyObj };
+    for (const f of missing) delete trimmed[f];
+
+    if (Object.keys(trimmed).length === 0) throw err;
+
+    console.warn("⚠️ ColumnNotFound. Retrying without fields:", missing);
+    return await caspioFetch(path, { method, body: trimmed });
+  }
+}
+
+function pickFirst(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return null;
+}
+
+function num2(v) {
+  const n = Number(String(v ?? "").trim().replace("%", ""));
+  return Number.isFinite(n) ? Number(n.toFixed(4)) : null;
+}
+
+// Converts tax “percent” or “rate” to a rate (0.055)
+function parseTaxToRate(val) {
+  const n = num2(val);
+  if (n == null || n < 0) return null;
+  if (n > 1) return Number((n / 100).toFixed(6));
+  return Number(n.toFixed(6));
+}
 
 async function getAllSourceRowsForResId(resId) {
   const where = `${RES_ID_FIELD}='${escWhereValue(resId)}'`;
@@ -341,75 +326,8 @@ async function getBillingViewRowByIdKey(idkey) {
   return (resp?.Result || [])[0] || null;
 }
 
-/**
- * If Caspio responds with ColumnNotFound / "do not exist" / invalid column,
- * drop those fields and retry once.
- */
-async function upsertRollupResilient(existing, rollupWhere, body) {
-  const whereParam = encodeURIComponent(rollupWhere);
-  const putUrl = `/rest/v2/tables/${ROLLUP_TABLE}/records?q.where=${whereParam}`;
-  const postUrl = `/rest/v2/tables/${ROLLUP_TABLE}/records`;
-
-  const attempt = async (payload) => {
-    if (existing) {
-      await caspioFetch(putUrl, { method: "PUT", body: payload });
-      return { action: "updated" };
-    }
-    await caspioFetch(postUrl, { method: "POST", body: payload });
-    return { action: "inserted" };
-  };
-
-  try {
-    return await attempt(body);
-  } catch (err) {
-    const msg = String(err?.message || "");
-    const isMissing =
-      /ColumnNotFound/i.test(msg) ||
-      /do not exist/i.test(msg) ||
-      /Invalid column/i.test(msg);
-
-    if (!isMissing) throw err;
-
-    const missing = [];
-    for (const m of msg.matchAll(/'([^']+)'/g)) missing.push(m[1]);
-
-    const trimmed = { ...body };
-    for (const f of missing) delete trimmed[f];
-
-    // If we couldn't parse which fields, conservatively drop optional enrichments
-    if (!missing.length) {
-      [
-        R_EMAIL_DESIGN,
-        R_LOGO,
-        R_UNITS_DBA,
-        R_SESSIONS_TITLE,
-        R_PREHEADER,
-        R_PCOLOR1,
-        R_PCOLOR2,
-        R_FACILITY,
-        R_TAX_SIGMA,
-        R_AUTO_GRAT_SIGMA,
-      ].forEach((k) => delete trimmed[k]);
-    }
-
-    if (Object.keys(trimmed).length === 0) throw err;
-
-    const r = await attempt(trimmed);
-    return { ...r, trimmed: true, missingFields: missing.length ? missing : "unknown" };
-  }
-}
-
 // ---------- handler ----------
-
-
-
 export default async function handler(req, res) {
-  console.log("ROLLUP_HIT:", {
-  method: req.method,
-  hasBody: !!req.body && Object.keys(req.body || {}).length > 0,
-  query: req.query,
-  contentType: req.headers["content-type"],
-});
   try {
     // Auth via query token (Caspio-friendly)
     const token = req.query?.token;
@@ -464,7 +382,7 @@ export default async function handler(req, res) {
             eventType: eventTypeRaw,
           });
         }
-        // unknown -> proceed
+        // unknown -> proceed for correctness
       }
     }
 
@@ -514,18 +432,88 @@ export default async function handler(req, res) {
       const Subtotal_Addon = addonRows.reduce((sum, r) => sum + toNum(r?.[LINE_TOTAL_FIELD]), 0);
       const Total = Subtotal_Primary + Subtotal_Addon;
 
-      // 4) ✅ Billing view enrichment (LOOKUP BY IDKEY)
+      // 4) Billing view lookup by IDKEY (for Tax_SIGMA + Auto_Gratuity_SIGMA AND reservation enrichment)
+      let taxRate = null;
+      let autoGrat = null;
       let viewRow = null;
+
       if (IDKEY) {
         try {
           viewRow = await getBillingViewRowByIdKey(String(IDKEY));
         } catch (e) {
-          // Non-blocking: keep totals correct even if view fails
-          viewRow = null;
+          console.warn("⚠️ Billing view lookup failed (non-blocking):", e?.message || e);
+        }
+
+        if (viewRow) {
+          taxRate = parseTaxToRate(viewRow?.[V_TAX_PCT]);
+          autoGrat = viewRow?.[V_AUTO_GRAT] ?? null;
+
+          // ---- Reservation enrichment writeback (to BAR2_Reservations_SIGMA) ----
+          // Only do this if we found a view row.
+          const emailHtml = pickFirst(viewRow, [
+            "BAR2_Email_Design_Email_Content",
+            "Email_Design_Email_Content",
+            "Email_Design",
+            "Email_Content",
+            "BAR2_Email_Design",
+            "EmailHTML",
+          ]);
+
+          const reservationUpdatePayload = {};
+
+          if (emailHtml) {
+            const maxLen = 64000;
+            const val = String(emailHtml);
+            reservationUpdatePayload.Email_Design = val.length > maxLen ? val.slice(0, maxLen) : val;
+          }
+
+          reservationUpdatePayload.Logo_Graphic_Email_String = pickFirst(viewRow, [
+            "GEN_Business_Units_Logo_Graphic_Email_String",
+            "Logo_Graphic_Email_String",
+            "LogoEmailString",
+          ]);
+
+          reservationUpdatePayload.Units_DBA = pickFirst(viewRow, ["GEN_Business_Units_DBA", "Units_DBA", "DBA"]);
+
+          reservationUpdatePayload.Sessions_Title = pickFirst(viewRow, ["BAR2_Sessions_Title", "Sessions_Title"]);
+
+          reservationUpdatePayload.Event_Email_Preheader = pickFirst(viewRow, [
+            "GEN_Business_Units_Event_Email_Preheader",
+            "Event_Email_Preheader",
+          ]);
+
+          reservationUpdatePayload.Primary_Color_1 = pickFirst(viewRow, [
+            "GEN_Business_Units_Primary_Color_1",
+            "Primary_Color_1",
+          ]);
+          reservationUpdatePayload.Primary_Color_2 = pickFirst(viewRow, [
+            "GEN_Business_Units_Primary_Color_2",
+            "Primary_Color_2",
+          ]);
+          reservationUpdatePayload.Facility = pickFirst(viewRow, ["GEN_Business_Units_Facility", "Facility"]);
+
+          // Strip null/empty fields so we don't overwrite with blanks
+          for (const k of Object.keys(reservationUpdatePayload)) {
+            const v = reservationUpdatePayload[k];
+            if (v === undefined || v === null || String(v).trim() === "") delete reservationUpdatePayload[k];
+          }
+
+          if (Object.keys(reservationUpdatePayload).length) {
+            const where = `IDKEY='${escWhereValue(String(IDKEY))}'`;
+            const path =
+              `/rest/v2/tables/${SOURCE_TABLE}/records?q.where=` +
+              encodeURIComponent(where);
+
+            try {
+              await caspioWriteResilient(path, "PUT", reservationUpdatePayload);
+            } catch (e) {
+              console.warn("⚠️ Reservation enrichment write failed (non-blocking):", e?.message || e);
+            }
+          }
         }
       }
 
-      // Build upsert body
+      // 5) Upsert rollup row (RES_ID keyed) with totals + tax/grat
       const upsertBody = {
         [ROLLUP_KEY_FIELD]: RES_ID,
         IDKEY,
@@ -534,56 +522,55 @@ export default async function handler(req, res) {
         Subtotal_Primary,
         Subtotal_Addon,
         Total,
+
+        // ✅ New fields
+        ...(taxRate != null ? { [ROLLUP_TAX_FIELD]: taxRate } : {}),
+        ...(autoGrat != null ? { [ROLLUP_AUTOGRAT_FIELD]: autoGrat } : {}),
       };
 
-      // ✅ Add Tax_SIGMA / Auto_Gratuity_SIGMA
-      if (viewRow) {
-        const taxRate = parseTaxPercentToRate(viewRow?.[V_TAX_PCT]);
-        const autoGrat = parseAutoGrat(viewRow?.[V_AUTO_GRAT]);
-
-        if (taxRate != null) upsertBody[R_TAX_SIGMA] = taxRate;
-        if (autoGrat != null) upsertBody[R_AUTO_GRAT_SIGMA] = autoGrat;
-
-        // ✅ Move webhook enrichment mapping into rollup row (optional cols)
-        const emailHtml = pickFirst(viewRow, EMAIL_HTML_KEYS);
-        if (emailHtml) {
-          const maxLen = 64000;
-          const val = String(emailHtml);
-          upsertBody[R_EMAIL_DESIGN] = val.length > maxLen ? val.slice(0, maxLen) : val;
-        }
-
-        upsertBody[R_LOGO] = pickFirst(viewRow, LOGO_KEYS);
-        upsertBody[R_UNITS_DBA] = pickFirst(viewRow, DBA_KEYS);
-
-        upsertBody[R_SESSIONS_TITLE] =
-          pickFirst(viewRow, SESS_TITLE_KEYS) || reservationRow?.Sessions_Title || null;
-
-        upsertBody[R_PREHEADER] = pickFirst(viewRow, PREHEADER_KEYS);
-        upsertBody[R_PCOLOR1] = pickFirst(viewRow, PC1_KEYS);
-        upsertBody[R_PCOLOR2] = pickFirst(viewRow, PC2_KEYS);
-        upsertBody[R_FACILITY] = pickFirst(viewRow, FACILITY_KEYS);
+      if (existing) {
+        await caspioWriteResilient(
+          `/rest/v2/tables/${ROLLUP_TABLE}/records?q.where=${encodeURIComponent(rollupWhere)}`,
+          "PUT",
+          upsertBody
+        );
+        return {
+          ok: true,
+          action: "updated",
+          RES_ID,
+          Total,
+          debug: {
+            sourceRowCount: rows.length,
+            reservationFound: !!reservationRow,
+            addonCount: addonRows.length,
+            Subtotal_Primary,
+            Subtotal_Addon,
+            resIdPath: norm.resIdPath,
+            billingViewFound: !!viewRow,
+            Tax_SIGMA: taxRate,
+            Auto_Gratuity_SIGMA: autoGrat,
+          },
+        };
+      } else {
+        await caspioWriteResilient(`/rest/v2/tables/${ROLLUP_TABLE}/records`, "POST", upsertBody);
+        return {
+          ok: true,
+          action: "inserted",
+          RES_ID,
+          Total,
+          debug: {
+            sourceRowCount: rows.length,
+            reservationFound: !!reservationRow,
+            addonCount: addonRows.length,
+            Subtotal_Primary,
+            Subtotal_Addon,
+            resIdPath: norm.resIdPath,
+            billingViewFound: !!viewRow,
+            Tax_SIGMA: taxRate,
+            Auto_Gratuity_SIGMA: autoGrat,
+          },
+        };
       }
-
-      // 5) Upsert rollup row (resilient)
-      const r = await upsertRollupResilient(existing, rollupWhere, upsertBody);
-
-      return {
-        ok: true,
-        action: r.action,
-        trimmed: !!r.trimmed,
-        missingFields: r.missingFields,
-        RES_ID,
-        Total,
-        debug: {
-          sourceRowCount: rows.length,
-          reservationFound: !!reservationRow,
-          addonCount: addonRows.length,
-          Subtotal_Primary,
-          Subtotal_Addon,
-          resIdPath: norm.resIdPath,
-          viewLookup: IDKEY ? (viewRow ? "found" : "null") : "skipped_no_idkey",
-        },
-      };
     })();
 
     INFLIGHT_BY_RESID.set(String(RES_ID), workPromise);
