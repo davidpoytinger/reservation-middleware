@@ -401,14 +401,15 @@ async function upsertRollupResilient(existing, rollupWhere, body) {
 
 // ---------- handler ----------
 
-console.log("ROLLUP_HIT:", {
+
+
+export default async function handler(req, res) {
+  console.log("ROLLUP_HIT:", {
   method: req.method,
   hasBody: !!req.body && Object.keys(req.body || {}).length > 0,
   query: req.query,
   contentType: req.headers["content-type"],
 });
-
-export default async function handler(req, res) {
   try {
     // Auth via query token (Caspio-friendly)
     const token = req.query?.token;
