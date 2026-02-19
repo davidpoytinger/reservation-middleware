@@ -6,9 +6,7 @@
 // - Removes RES_ID from transaction inserts
 // - Rolls up totals (no UpdatedAt expected in rollup table)
 //
-// ✅ SUBTRACTION:
-// - Removed billing view lookup + enrichment mapping block from webhook.
-//   (That logic is now in sigma-rollup-total-res.js keyed by IDKEY from reservation row.)
+// NOTE: Enrichment (Email_Design / branding fields) moved to sigma-rollup-total-res.js
 
 import Stripe from "stripe";
 import {
@@ -88,10 +86,20 @@ function getConfirmationNumberFromReservationRow(row) {
 function parseBreakdown(meta, totalAmountDollars) {
   const m = meta || {};
 
+  // Accept multiple key styles
   const baseRaw = m.base_amount ?? m.baseAmount ?? m.Base_Amount ?? m.base ?? m.Base ?? null;
+
   const gratRaw =
-    m.grat_amount ?? m.gratAmount ?? m.Auto_Gratuity ?? m.auto_gratuity ?? m.grat ?? m.Gratuity ?? null;
+    m.grat_amount ??
+    m.gratAmount ??
+    m.Auto_Gratuity ??
+    m.auto_gratuity ??
+    m.grat ??
+    m.Gratuity ??
+    null;
+
   const taxRaw = m.tax_amount ?? m.taxAmount ?? m.Tax ?? m.tax ?? null;
+
   const feeRaw = m.fee_amount ?? m.feeAmount ?? m.Fee ?? m.fee ?? null;
 
   const hasAny = baseRaw != null || gratRaw != null || taxRaw != null || feeRaw != null;
@@ -105,6 +113,7 @@ function parseBreakdown(meta, totalAmountDollars) {
     return { base, grat, tax, fee, amount };
   }
 
+  // Legacy fallback: all in Fee
   const total = n2(totalAmountDollars);
   return { base: 0, grat: 0, tax: 0, fee: total, amount: total };
 }
@@ -146,7 +155,7 @@ export default async function handler(req, res) {
     }
 
     // ------------------------------------------------------------
-    // 1) CHECKOUT COMPLETED
+    // 1) CHECKOUT COMPLETED  (ONLY source for checkout payments)
     // ------------------------------------------------------------
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
@@ -193,7 +202,7 @@ export default async function handler(req, res) {
 
       const where = `IDKEY='${escapeWhereValue(idkey)}'`;
 
-      // Reservation update payload (Stripe truth fields)
+      // Reservation update payload (payment fields only)
       const payload = {
         BookingFeePaidAt: paidAtIso,
         StripeCheckoutSessionId: fullSession.id,
@@ -222,11 +231,6 @@ export default async function handler(req, res) {
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
       const mdSession = fullSession?.metadata || session?.metadata || {};
-      const mdPI = paymentIntent?.metadata || {};
-
-      console.log("MD_KEYS_SESSION:", Object.keys(mdSession || {}));
-      console.log("MD_KEYS_PI:", Object.keys(mdPI || {}));
-
       const breakdown = parseBreakdown(mdSession, amountDollars);
 
       let reservationChargeType = metaChargeType;
@@ -313,7 +317,6 @@ export default async function handler(req, res) {
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      console.log("MD_KEYS_PI_OFFSESSION:", Object.keys(piFull?.metadata || {}));
       const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
 
       const txnPayload = {
