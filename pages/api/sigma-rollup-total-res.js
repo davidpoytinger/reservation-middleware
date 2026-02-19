@@ -295,7 +295,10 @@ async function caspioFetch(path, { method = "GET", body } = {}) {
   const token = await getCaspioToken();
   const base = process.env.CASPIO_BASE_URL;
 
-  const resp = await fetch(`${base}${path}`, {
+  const url = `${base}${path}`;
+  console.log("CASPIO_FETCH:", method, url);
+
+  const resp = await fetch(url, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -306,15 +309,15 @@ async function caspioFetch(path, { method = "GET", body } = {}) {
   });
 
   const text = await resp.text();
-  if (!resp.ok) throw new Error(`Caspio ${method} failed ${resp.status}: ${text}`);
+  if (!resp.ok) {
+    console.error("CASPIO_ERR:", method, url, resp.status, text);
+    throw new Error(`Caspio ${method} failed ${resp.status}: ${text}`);
+  }
 
   if (!text) return null;
-  try {
-    return JSON.parse(text);
-  } catch {
-    return { raw: text };
-  }
+  try { return JSON.parse(text); } catch { return { raw: text }; }
 }
+
 
 async function getAllSourceRowsForResId(resId) {
   const where = `${RES_ID_FIELD}='${escWhereValue(resId)}'`;
