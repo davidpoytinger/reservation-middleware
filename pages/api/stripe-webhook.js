@@ -1,18 +1,20 @@
 // pages/api/stripe-webhook.js
 //
 // Debug-enabled Stripe webhook for SIGMA
-// - Adds safe debug logs for billing view lookup + keys
 // - Keeps "one transaction per successful checkout" behavior
 // - Off-session PI logging is gated by metadata.source === "off_session"
 // - Removes RES_ID from transaction inserts
 // - Rolls up totals (no UpdatedAt expected in rollup table)
+//
+// ✅ SUBTRACTION:
+// - Removed billing view lookup + enrichment mapping block from webhook.
+//   (That logic is now in sigma-rollup-total-res.js keyed by IDKEY from reservation row.)
 
 import Stripe from "stripe";
 import {
   updateReservationByWhere,
   insertTransactionIfMissingByRawEventId,
   getReservationByIdKey,
-  getResBillingEditViewRowByIdKey,
   rollupTotalsForIdKey,
 } from "../../lib/caspio";
 
@@ -39,14 +41,6 @@ function dollarsFromCents(cents) {
 function n2(v) {
   const n = Number(v);
   return Number.isFinite(n) ? Number(n.toFixed(2)) : 0;
-}
-
-function pickFirst(obj, keys) {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
-  }
-  return null;
 }
 
 /**
@@ -94,21 +88,13 @@ function getConfirmationNumberFromReservationRow(row) {
 function parseBreakdown(meta, totalAmountDollars) {
   const m = meta || {};
 
-  // Accept multiple key styles
-  const baseRaw =
-    m.base_amount ?? m.baseAmount ?? m.Base_Amount ?? m.base ?? m.Base ?? null;
-
+  const baseRaw = m.base_amount ?? m.baseAmount ?? m.Base_Amount ?? m.base ?? m.Base ?? null;
   const gratRaw =
     m.grat_amount ?? m.gratAmount ?? m.Auto_Gratuity ?? m.auto_gratuity ?? m.grat ?? m.Gratuity ?? null;
+  const taxRaw = m.tax_amount ?? m.taxAmount ?? m.Tax ?? m.tax ?? null;
+  const feeRaw = m.fee_amount ?? m.feeAmount ?? m.Fee ?? m.fee ?? null;
 
-  const taxRaw =
-    m.tax_amount ?? m.taxAmount ?? m.Tax ?? m.tax ?? null;
-
-  const feeRaw =
-    m.fee_amount ?? m.feeAmount ?? m.Fee ?? m.fee ?? null;
-
-  const hasAny =
-    baseRaw != null || gratRaw != null || taxRaw != null || feeRaw != null;
+  const hasAny = baseRaw != null || gratRaw != null || taxRaw != null || feeRaw != null;
 
   if (hasAny) {
     const base = n2(baseRaw);
@@ -119,7 +105,6 @@ function parseBreakdown(meta, totalAmountDollars) {
     return { base, grat, tax, fee, amount };
   }
 
-  // Legacy fallback: all in Fee
   const total = n2(totalAmountDollars);
   return { base: 0, grat: 0, tax: 0, fee: total, amount: total };
 }
@@ -147,7 +132,6 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err?.message || "bad signature"}`);
   }
 
-  // ---- DEBUG breadcrumb: what event are we processing?
   console.log("STRIPE_EVENT:", event?.type, "EVENT_ID:", event?.id);
 
   try {
@@ -162,7 +146,7 @@ export default async function handler(req, res) {
     }
 
     // ------------------------------------------------------------
-    // 1) CHECKOUT COMPLETED  (ONLY source for checkout payments)
+    // 1) CHECKOUT COMPLETED
     // ------------------------------------------------------------
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
@@ -190,9 +174,7 @@ export default async function handler(req, res) {
       const charge = paymentIntent?.charges?.data?.[0];
       const card =
         charge?.payment_method_details?.card ||
-        (typeof paymentIntent?.payment_method !== "string"
-          ? paymentIntent?.payment_method?.card
-          : null);
+        (typeof paymentIntent?.payment_method !== "string" ? paymentIntent?.payment_method?.card : null);
 
       const amountDollars = dollarsFromCents(paymentIntent?.amount_received ?? paymentIntent?.amount ?? null);
       const currency = paymentIntent?.currency?.toLowerCase() || "usd";
@@ -211,22 +193,7 @@ export default async function handler(req, res) {
 
       const where = `IDKEY='${escapeWhereValue(idkey)}'`;
 
-      // ---- DEBUG breadcrumbs: billing view configured? did we get a row?
-      const billingViewName = String(process.env.CASPIO_RES_BILLING_VIEW || "").trim();
-      console.log("BILLING_VIEW_NAME:", billingViewName || "(not set)");
-
-      // VIEW LOOKUP (non-blocking)
-      let viewRow = null;
-      try {
-        viewRow = await getResBillingEditViewRowByIdKey(idkey);
-      } catch (e) {
-        console.warn("⚠️ VIEW_LOOKUP_FAILED (non-blocking)", e?.message || e);
-      }
-
-      console.log("BILLING_VIEW_ROW:", viewRow ? "found" : "null");
-      if (viewRow) console.log("BILLING_VIEW_KEYS:", Object.keys(viewRow));
-
-      // Reservation update payload
+      // Reservation update payload (Stripe truth fields)
       const payload = {
         BookingFeePaidAt: paidAtIso,
         StripeCheckoutSessionId: fullSession.id,
@@ -248,63 +215,20 @@ export default async function handler(req, res) {
       if (metaSessionsTitle) payload.Sessions_Title = metaSessionsTitle;
       if (metaPeopleText) payload.People_Text = metaPeopleText;
 
-      // Enrichment mapping (handles alias drift)
-      if (viewRow) {
-        const emailHtml = pickFirst(viewRow, [
-          "BAR2_Email_Design_Email_Content",
-          "Email_Design_Email_Content",
-          "Email_Design",
-          "Email_Content",
-          "BAR2_Email_Design",
-          "EmailHTML",
-        ]);
-
-        if (emailHtml) {
-          const maxLen = 64000;
-          const val = String(emailHtml);
-          payload.Email_Design = val.length > maxLen ? val.slice(0, maxLen) : val;
-        }
-
-        payload.Logo_Graphic_Email_String = pickFirst(viewRow, [
-          "GEN_Business_Units_Logo_Graphic_Email_String",
-          "Logo_Graphic_Email_String",
-          "LogoEmailString",
-        ]);
-
-        payload.Units_DBA = pickFirst(viewRow, ["GEN_Business_Units_DBA", "Units_DBA", "DBA"]);
-
-        payload.Sessions_Title =
-          pickFirst(viewRow, ["BAR2_Sessions_Title", "Sessions_Title"]) || payload.Sessions_Title || null;
-
-        payload.Event_Email_Preheader = pickFirst(viewRow, [
-          "GEN_Business_Units_Event_Email_Preheader",
-          "Event_Email_Preheader",
-        ]);
-
-        payload.Primary_Color_1 = pickFirst(viewRow, ["GEN_Business_Units_Primary_Color_1", "Primary_Color_1"]);
-        payload.Primary_Color_2 = pickFirst(viewRow, ["GEN_Business_Units_Primary_Color_2", "Primary_Color_2"]);
-        payload.Facility = pickFirst(viewRow, ["GEN_Business_Units_Facility", "Facility"]);
-
-        console.log("ENRICHMENT_EMAIL_DESIGN_LEN:", payload.Email_Design ? String(payload.Email_Design).length : 0);
-      }
-
       await updateReservationResilient(where, payload);
 
       // Pull reservation once for Charge_Type fallback + Confirmation_Number
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-// IMPORTANT: For Checkout, Session metadata is the most reliable place.
-// (Sometimes paymentIntent.metadata is not what you expect depending on how session was created.)
-const mdSession = fullSession?.metadata || session?.metadata || {};
-const mdPI = paymentIntent?.metadata || {};
+      const mdSession = fullSession?.metadata || session?.metadata || {};
+      const mdPI = paymentIntent?.metadata || {};
 
-console.log("MD_KEYS_SESSION:", Object.keys(mdSession || {}));
-console.log("MD_KEYS_PI:", Object.keys(mdPI || {}));
+      console.log("MD_KEYS_SESSION:", Object.keys(mdSession || {}));
+      console.log("MD_KEYS_PI:", Object.keys(mdPI || {}));
 
-const breakdown = parseBreakdown(mdSession, amountDollars);
+      const breakdown = parseBreakdown(mdSession, amountDollars);
 
-      // Transaction insert (components + confirmation)
       let reservationChargeType = metaChargeType;
       if (!reservationChargeType) reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
 
@@ -328,7 +252,6 @@ const breakdown = parseBreakdown(mdSession, amountDollars);
         StripeCustomerId: stripeCustomerId,
         StripePaymentMethodId: stripePaymentMethodId,
 
-        // NOTE: NO RES_ID stored in transaction table
         Charge_Type: reservationChargeType,
         Description: reservationChargeType,
 
@@ -354,7 +277,6 @@ const breakdown = parseBreakdown(mdSession, amountDollars);
     if (event.type === "payment_intent.succeeded") {
       const pi = event.data.object;
 
-      // ✅ Gate: ONLY log off-session charge tool payments
       const source = String(pi?.metadata?.source || "").toLowerCase();
       if (source !== "off_session" && source !== "off-session") {
         console.log("PI_SUCCEEDED_SKIPPED_SOURCE:", source || "(missing)");
@@ -388,12 +310,11 @@ const breakdown = parseBreakdown(mdSession, amountDollars);
       const chargeType = piFull?.metadata?.Charge_Type || "supplemental_charge";
       const description = piFull?.metadata?.Description || chargeType;
 
-      // Confirmation_Number
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
       console.log("MD_KEYS_PI_OFFSESSION:", Object.keys(piFull?.metadata || {}));
-const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
+      const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
 
       const txnPayload = {
         IDKEY: String(idkey),
@@ -420,7 +341,6 @@ const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
 
         Confirmation_Number: confirmationNumber,
 
-        // Optional: store card snapshot too (non-critical)
         Card_brand: card?.brand || null,
         Card_number_masked: card?.last4 ? `**** **** **** ${card.last4}` : null,
         Card_expiration: card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
@@ -456,7 +376,6 @@ const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
         pi = await stripe.paymentIntents.retrieve(paymentIntentId).catch(() => null);
       }
 
-      // Prefer PI metadata, fall back to refund.metadata (more robust)
       const idkey = getIdKeyFromMetadata(pi?.metadata) || getIdKeyFromMetadata(refund?.metadata);
       if (!idkey) return res.status(200).json({ received: true });
 
@@ -469,11 +388,9 @@ const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
       const chargeType = pi?.metadata?.Charge_Type || refund?.metadata?.Charge_Type || "refund";
       const description = `Refund - ${chargeType}`;
 
-      // Confirmation_Number
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      // Pro-rate refund across components (based on original breakdown)
       const original = parseBreakdown(pi?.metadata || {}, null);
       const refundTotal = n2(amountDollars);
       const originalTotal = n2(original.amount);
@@ -526,12 +443,9 @@ const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
       return res.status(200).json({ received: true });
     }
 
-    // Default: ACK everything else
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error("❌ WEBHOOK_FAILED", err?.message || err);
-
-    // Keep your current behavior: 200 so Stripe doesn't retry endlessly
     return res.status(200).json({ received: true });
   }
 }
