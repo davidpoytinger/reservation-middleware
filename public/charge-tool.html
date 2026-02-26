@@ -16,16 +16,12 @@
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
     }
 
-    .wrap {
-      padding: 18px 18px 22px;
-      max-width: 980px;
-    }
+    .wrap { padding: 18px; max-width: 980px; }
 
     h2 {
       margin: 0 0 6px 0;
       font-size: 22px;
       font-weight: 900;
-      letter-spacing: -0.01em;
     }
 
     .sub {
@@ -38,7 +34,6 @@
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: var(--gap);
-      align-items: start;
     }
 
     .full { grid-column: 1 / -1; }
@@ -48,7 +43,6 @@
       font-size: 13px;
       font-weight: 800;
       margin: 0 0 6px 0;
-      line-height: 1.2;
     }
 
     input, select, textarea {
@@ -58,23 +52,17 @@
       padding: 10px 12px;
       border: 1px solid #cfcfcf;
       border-radius: 10px;
-      background: #fff;
-      color: #111;
-      line-height: 1.25;
     }
 
-    textarea {
-      min-height: 86px;
-      resize: vertical;
-    }
+    textarea { min-height: 86px; resize: vertical; }
 
     .footer {
       margin-top: 16px;
       display: flex;
-      gap: 14px;
-      align-items: flex-start;
       justify-content: space-between;
+      align-items: flex-start;
       flex-wrap: wrap;
+      gap: 14px;
     }
 
     .totals {
@@ -86,10 +74,7 @@
     .totals .line {
       display: flex;
       justify-content: space-between;
-      gap: 18px;
     }
-
-    .totals .line strong { font-weight: 900; }
 
     .btn {
       padding: 12px 16px;
@@ -99,7 +84,6 @@
       color: #fff;
       font-weight: 900;
       cursor: pointer;
-      white-space: nowrap;
     }
 
     .btn[disabled] { opacity: .6; cursor: not-allowed; }
@@ -127,205 +111,160 @@
 </head>
 
 <body>
-  <div class="wrap">
-    <h2>Charge Supplemental Fee</h2>
-    <p class="sub" id="idkeyMsg"></p>
+<div class="wrap">
+  <h2>Charge Supplemental Fee</h2>
+  <p class="sub" id="idkeyMsg"></p>
 
-    <div class="grid">
-      <div>
-        <label for="base">Base Charge ($)</label>
-        <input id="base" type="number" step="0.01" min="0" placeholder="e.g. 100.00" />
-      </div>
-
-      <div>
-        <label for="type">Adjustment Type</label>
-        <select id="type">
-          <option>Manual Charge</option>
-          <option>Late Cancel</option>
-          <option>No Show</option>
-          <option>Added People</option>
-          <option>Minimum Spend Shortfall</option>
-          <option>Damage Fee</option>
-        </select>
-      </div>
-
-      <div class="full">
-        <label for="desc">Description (required)</label>
-        <input id="desc" placeholder="e.g. Added 5 guests at check-in" />
-      </div>
-
-      <div>
-        <label for="tax">Tax %</label>
-        <input id="tax" type="number" step="0.01" min="0" value="6.1" />
-      </div>
-
-      <div>
-        <label for="grat">Auto Grat %</label>
-        <input id="grat" type="number" step="0.01" min="0" value="15" />
-      </div>
-
-      <div class="full">
-        <label for="reason">Internal Notes</label>
-        <textarea id="reason" placeholder="Optional internal notes…"></textarea>
-      </div>
-
-      <div class="full">
-        <div class="status" id="status"></div>
-      </div>
+  <div class="grid">
+    <div>
+      <label for="base">Base Charge ($)</label>
+      <input id="base" type="number" step="0.01" min="0" />
     </div>
 
-    <div class="footer">
-      <div class="totals" id="totals"></div>
+    <div>
+      <label for="type">Adjustment Type</label>
+      <select id="type">
+        <option>Manual Charge</option>
+        <option>Late Cancel</option>
+        <option>No Show</option>
+        <option>Added People</option>
+        <option>Minimum Spend Shortfall</option>
+        <option>Damage Fee</option>
+      </select>
+    </div>
 
-      <button class="btn" id="chargeBtn" type="button">
-        Confirm Charge
-      </button>
+    <div class="full">
+      <label for="desc">Description (required)</label>
+      <input id="desc" placeholder="e.g. Added 5 guests at check-in" />
+    </div>
+
+    <div>
+      <label for="tax">Tax %</label>
+      <input id="tax" type="number" step="0.01" value="6.1" />
+    </div>
+
+    <div>
+      <label for="grat">Auto Grat %</label>
+      <input id="grat" type="number" step="0.01" value="15" />
+    </div>
+
+    <div class="full">
+      <label for="reason">Internal Notes</label>
+      <textarea id="reason"></textarea>
+    </div>
+
+    <div class="full">
+      <div class="status" id="status"></div>
     </div>
   </div>
 
+  <div class="footer">
+    <div class="totals" id="totals"></div>
+    <button class="btn" id="chargeBtn" type="button">Confirm Charge</button>
+  </div>
+</div>
+
 <script>
-  const params = new URLSearchParams(location.search);
-  const IDKEY = (params.get("IDKEY") || params.get("idkey") || "").trim();
+const ADMIN_CHARGE_KEY = "BR_CHARGE_9sj3k2h29sjdksu832kxnvgq930qa";
 
-  const idkeyMsg = document.getElementById("idkeyMsg");
-  const statusEl = document.getElementById("status");
-  const chargeBtn = document.getElementById("chargeBtn");
+const params = new URLSearchParams(location.search);
+const IDKEY = (params.get("IDKEY") || params.get("idkey") || "").trim();
 
-  function show(kind, msg) {
-    statusEl.className = "status " + kind;
-    statusEl.style.display = "block";
-    statusEl.textContent = msg;
-  }
+const idkeyMsg = document.getElementById("idkeyMsg");
+const statusEl = document.getElementById("status");
+const chargeBtn = document.getElementById("chargeBtn");
 
-  function num(v) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : 0;
-  }
-  function round2(n) { return Math.round(n * 100) / 100; }
-
-  function compute() {
-    const base = num(document.getElementById("base").value);
-    const taxPct = num(document.getElementById("tax").value || 6.1);
-    const gratPct = num(document.getElementById("grat").value || 15);
-
-    const tax = round2(base * (taxPct / 100));
-    const grat = round2(base * (gratPct / 100));
-    const total = round2(base + tax + grat);
-
-    document.getElementById("totals").innerHTML = `
-      <div class="line"><span>Base</span><span>$${base.toFixed(2)}</span></div>
-      <div class="line"><span>Tax (${taxPct.toFixed(2)}%)</span><span>$${tax.toFixed(2)}</span></div>
-      <div class="line"><span>Auto Grat (${gratPct.toFixed(2)}%)</span><span>$${grat.toFixed(2)}</span></div>
-      <div style="border-top:1px solid #eee; margin-top:8px; padding-top:8px;"></div>
-      <div class="line"><strong>Total</strong><strong>$${total.toFixed(2)}</strong></div>
-    `;
-
-    return { base, taxPct, gratPct };
-  }
-
-  ["base","tax","grat"].forEach(id => {
-    document.getElementById(id).addEventListener("input", compute);
-  });
-
-  if (IDKEY) {
-    idkeyMsg.textContent = "IDKEY: " + IDKEY;
-  } else {
-    idkeyMsg.textContent = "⚠ Missing IDKEY in URL (add ?IDKEY=XXXX).";
-  }
-
-  compute();
-
-function showSuccessAndClose() {
-  const overlay = document.createElement("div");
-  overlay.style.position = "fixed";
-  overlay.style.inset = "0";
-  overlay.style.background = "rgba(0,0,0,0.35)";
-  overlay.style.display = "flex";
-  overlay.style.alignItems = "center";
-  overlay.style.justifyContent = "center";
-  overlay.style.zIndex = "99999";
-
-  const box = document.createElement("div");
-  box.style.background = "#fff";
-  box.style.borderRadius = "14px";
-  box.style.padding = "20px 24px";
-  box.style.boxShadow = "0 10px 30px rgba(0,0,0,0.2)";
-  box.style.textAlign = "center";
-  box.style.minWidth = "260px";
-
-  box.innerHTML = `
-    <div style="font-size:36px;">✅</div>
-    <div style="font-weight:900; margin-top:6px;">Charge Successful</div>
-    <div style="font-size:13px; opacity:.7; margin-top:4px;">Refreshing page…</div>
-  `;
-
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-
-  // ✅ Tell parent to close modal + reload
-  setTimeout(() => {
-    try {
-      window.parent.postMessage({ type: "BAR_CHARGE_DONE" }, "*");
-    } catch (e) {}
-
-    // Optional: stop user seeing the form again while parent reloads
-    try { document.body.innerHTML = ""; } catch (e) {}
-  }, 900);
+function show(kind, msg) {
+  statusEl.className = "status " + kind;
+  statusEl.style.display = "block";
+  statusEl.textContent = msg;
 }
 
-  chargeBtn.addEventListener("click", async () => {
-    if (!IDKEY) return show("bad", "Missing IDKEY in URL.");
+function num(v){ const n = Number(v); return Number.isFinite(n) ? n : 0; }
+function round2(n){ return Math.round(n * 100) / 100; }
 
-    const description = (document.getElementById("desc").value || "").trim();
-    if (!description) return show("bad", "Description is required.");
+function compute(){
+  const base = num(document.getElementById("base").value);
+  const taxPct = num(document.getElementById("tax").value);
+  const gratPct = num(document.getElementById("grat").value);
 
-    const c = compute();
-    if (!c.base || c.base <= 0) return show("bad", "Base must be greater than 0.");
+  const tax = round2(base * (taxPct/100));
+  const grat = round2(base * (gratPct/100));
+  const total = round2(base + tax + grat);
 
-    const payload = {
-      IDKEY,
-      baseAmount: c.base,
-      taxPct: c.taxPct,
-      gratPct: c.gratPct,
-      adjustmentType: document.getElementById("type").value,
-      description,
-      reason: document.getElementById("reason").value
-    };
+  document.getElementById("totals").innerHTML = `
+    <div class="line"><span>Base</span><span>$${base.toFixed(2)}</span></div>
+    <div class="line"><span>Tax (${taxPct.toFixed(2)}%)</span><span>$${tax.toFixed(2)}</span></div>
+    <div class="line"><span>Auto Grat (${gratPct.toFixed(2)}%)</span><span>$${grat.toFixed(2)}</span></div>
+    <div style="border-top:1px solid #eee;margin-top:8px;padding-top:8px;"></div>
+    <div class="line"><strong>Total</strong><strong>$${total.toFixed(2)}</strong></div>
+  `;
 
-    chargeBtn.disabled = true;
-    show("warn", "Processing…");
+  return { base, taxPct, gratPct };
+}
 
-    try {
-      const resp = await fetch("/api/charge-adjustment", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+["base","tax","grat"].forEach(id=>{
+  document.getElementById(id).addEventListener("input", compute);
+});
 
-      const json = await resp.json().catch(() => ({}));
+idkeyMsg.textContent = IDKEY ? "IDKEY: " + IDKEY : "⚠ Missing IDKEY in URL.";
+compute();
 
-      if (!resp.ok || !json.ok) {
-        show("bad", JSON.stringify(json, null, 2) || "Charge failed.");
-        chargeBtn.disabled = false;
-        return;
-      }
+function closeParent(){
+  try {
+    window.parent.postMessage({ type: "BAR_CHARGE_DONE" }, "*");
+  } catch(e){}
+}
 
-      // Off-session success
-      if (json.mode === "off_session" && json.payment_intent?.status === "succeeded") {
-        showSuccessAndClose();
-        return;
-      }
+chargeBtn.addEventListener("click", async ()=>{
+  if (!IDKEY) return show("bad","Missing IDKEY.");
+  const desc = document.getElementById("desc").value.trim();
+  if (!desc) return show("bad","Description is required.");
 
-      // Fallback display
-      show("ok", "SUCCESS\n\n" + JSON.stringify(json, null, 2));
+  const c = compute();
+  if (!c.base || c.base <= 0) return show("bad","Base must be greater than 0.");
 
-    } catch (e) {
-      show("bad", "Failed: " + (e?.message || String(e)));
-    } finally {
+  const payload = {
+    idkey: IDKEY,
+    type: document.getElementById("type").value,
+    why: desc,
+    base_amount: c.base,
+    tax_pct: c.taxPct,
+    grat_pct: c.gratPct
+  };
+
+  chargeBtn.disabled = true;
+  show("warn","Processing…");
+
+  try{
+    const resp = await fetch("/api/charge-adjustment", {
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json",
+        "x-charge-key": ADMIN_CHARGE_KEY
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await resp.text();
+    let json;
+    try { json = JSON.parse(text); }
+    catch { json = { ok:false, error:text }; }
+
+    if (!resp.ok || !json.ok){
+      show("bad", json.error || text);
       chargeBtn.disabled = false;
+      return;
     }
-  });
-</script>
 
+    show("ok","Charge submitted successfully.");
+    setTimeout(closeParent, 900);
+
+  } catch(e){
+    show("bad", e?.message || String(e));
+    chargeBtn.disabled = false;
+  }
+});
+</script>
 </body>
 </html>
