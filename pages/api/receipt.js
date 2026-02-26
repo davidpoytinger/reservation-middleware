@@ -4,7 +4,7 @@
 // Looks up a transaction by TXN_ID (stored as text in Caspio).
 // Includes CORS for reservebarsandrec.com.
 
-import { findOneByWhere, escapeWhereValue } from "../../lib/caspio";
+import { findOneByWhereInTable, escapeWhereValue } from "../../lib/caspio";
 
 function setCors(req, res) {
   const allowed = [
@@ -32,12 +32,11 @@ export default async function handler(req, res) {
 
     if (!txnId) return res.status(400).send("Missing txn_id");
 
-    // IMPORTANT:
-    // TXN_ID is NVARCHAR in Caspio (error proves this), so ALWAYS quote it.
+    // TXN_ID is NVARCHAR in Caspio, so ALWAYS quote it.
     const table = process.env.CASPIO_TXN_TABLE || "SIGMA_BAR3_Transactions";
     const where = `TXN_ID='${escapeWhereValue(txnId)}'`;
 
-    const row = await findOneByWhere(table, where);
+    const row = await findOneByWhereInTable(table, where);
     if (!row) return res.status(404).send("Transaction not found");
 
     res.setHeader("Cache-Control", "no-store");
