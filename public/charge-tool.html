@@ -1,8 +1,180 @@
-<!-- charge-tool.html (ONLY the JS section needs updates) -->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Charge Supplemental Fee</title>
+
+  <style>
+    :root { --gap: 14px; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #fff;
+      color: #111;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+
+    .wrap {
+      padding: 18px 18px 22px;
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    h2 {
+      margin: 0 0 6px 0;
+      font-size: 22px;
+      font-weight: 900;
+      letter-spacing: -0.01em;
+    }
+
+    .sub {
+      font-size: 13px;
+      opacity: .8;
+      margin: 0 0 16px 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--gap);
+      align-items: start;
+    }
+
+    .full { grid-column: 1 / -1; }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 800;
+      margin: 0 0 6px 0;
+      line-height: 1.2;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      font-size: 14px;
+      padding: 10px 12px;
+      border: 1px solid #cfcfcf;
+      border-radius: 10px;
+      background: #fff;
+      color: #111;
+      line-height: 1.25;
+    }
+
+    textarea { min-height: 86px; resize: vertical; }
+
+    .footer {
+      margin-top: 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      gap: 14px;
+    }
+
+    .totals {
+      font-size: 14px;
+      line-height: 1.7;
+      min-width: 260px;
+    }
+
+    .totals .line {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .totals .line strong { font-weight: 900; }
+
+    .btn {
+      padding: 12px 18px;
+      border-radius: 12px;
+      border: none;
+      background: #111;
+      color: #fff;
+      font-weight: 900;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .btn[disabled] {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .status {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #ddd;
+      background: #f7f7f7;
+      font-size: 13px;
+      display: none;
+      white-space: pre-wrap;
+    }
+
+    .ok   { background: #eaffef; border-color: #b8f0c7; }
+    .bad  { background: #fff1f1; border-color: #f2bcbc; }
+    .warn { background: #fffbe8; border-color: #f1e2a6; }
+  </style>
+</head>
+
+<body>
+<div class="wrap">
+  <h2>Charge Supplemental Fee</h2>
+  <p class="sub" id="idkeyMsg"></p>
+
+  <div class="grid">
+    <div>
+      <label for="base">Base Charge ($)</label>
+      <input id="base" type="number" step="0.01" min="0" placeholder="e.g. 100.00" />
+    </div>
+
+    <div>
+      <label for="type">Adjustment Type</label>
+      <select id="type">
+        <option>Manual Charge</option>
+        <option>Late Cancel</option>
+        <option>No Show</option>
+        <option>Added People</option>
+        <option>Minimum Spend Shortfall</option>
+        <option>Damage Fee</option>
+      </select>
+    </div>
+
+    <div class="full">
+      <label for="desc">Description (required)</label>
+      <input id="desc" placeholder="e.g. Added 5 guests at check-in" />
+    </div>
+
+    <div>
+      <label for="tax">Tax %</label>
+      <input id="tax" type="number" step="0.01" value="6.1" />
+    </div>
+
+    <div>
+      <label for="grat">Auto Grat %</label>
+      <input id="grat" type="number" step="0.01" value="15" />
+    </div>
+
+    <div class="full">
+      <label for="reason">Internal Notes</label>
+      <textarea id="reason" placeholder="Optional internal notes…"></textarea>
+    </div>
+
+    <div class="full">
+      <div class="status" id="status"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div class="totals" id="totals"></div>
+    <button class="btn" id="chargeBtn" type="button">Confirm Charge</button>
+  </div>
+</div>
+
 <script>
-  // ============================
-  // CONFIG
-  // ============================
   const ADMIN_CHARGE_KEY = "BR_CHARGE_9sj3k2h29sjdksu832kxnvgq930qa";
   const API_URL = "/api/charge-adjustment";
 
@@ -23,6 +195,7 @@
     const n = Number(v);
     return Number.isFinite(n) ? n : 0;
   }
+
   function round2(n) {
     return Math.round(n * 100) / 100;
   }
@@ -40,109 +213,92 @@
       <div class="line"><span>Base</span><span>$${base.toFixed(2)}</span></div>
       <div class="line"><span>Tax (${taxPct.toFixed(2)}%)</span><span>$${tax.toFixed(2)}</span></div>
       <div class="line"><span>Auto Grat (${gratPct.toFixed(2)}%)</span><span>$${grat.toFixed(2)}</span></div>
-      <div style="border-top:1px solid #eee; margin-top:8px; padding-top:8px;"></div>
+      <div style="border-top:1px solid #eee;margin-top:8px;padding-top:8px;"></div>
       <div class="line"><strong>Total</strong><strong>$${total.toFixed(2)}</strong></div>
     `;
 
-    return { base, taxPct, gratPct, tax, grat, total };
+    return { base, taxPct, gratPct, total };
   }
 
-  ["base", "tax", "grat"].forEach((id) => document.getElementById(id).addEventListener("input", compute));
+  ["base","tax","grat"].forEach(id =>
+    document.getElementById(id).addEventListener("input", compute)
+  );
 
   if (IDKEY) idkeyMsg.textContent = "IDKEY: " + IDKEY;
-  else idkeyMsg.textContent = "⚠ Missing IDKEY in URL (add ?IDKEY=XXXX).";
+  else idkeyMsg.textContent = "⚠ Missing IDKEY in URL.";
 
   compute();
 
   function showSuccessAndClose() {
     show("ok", "✅ Charge Successful\n\nRefreshing parent page…");
     setTimeout(() => {
-      try {
-        window.parent.postMessage({ type: "BAR_CHARGE_DONE" }, "*");
-      } catch (e) {}
-      try {
-        document.body.innerHTML = "";
-      } catch (e) {}
+      try { window.parent.postMessage({ type: "BAR_CHARGE_DONE" }, "*"); } catch(e){}
+      try { document.body.innerHTML = ""; } catch(e){}
     }, 900);
   }
 
-  async function readResponseAny(resp) {
-    const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    const text = await resp.text().catch(() => "");
-    let json = null;
-    if (ct.includes("application/json")) {
-      try {
-        json = JSON.parse(text);
-      } catch (e) {
-        json = null;
-      }
-    } else {
-      try {
-        json = JSON.parse(text);
-      } catch (e) {
-        json = null;
-      }
-    }
-    return { text, json };
+  async function readResponse(resp) {
+    const text = await resp.text();
+    try { return JSON.parse(text); }
+    catch { return { ok:false, error:text }; }
   }
 
   chargeBtn.addEventListener("click", async () => {
-    if (!IDKEY) return show("bad", "Missing IDKEY in URL.");
-
+    if (!IDKEY) return show("bad","Missing IDKEY.");
     const description = (document.getElementById("desc").value || "").trim();
-    if (!description) return show("bad", "Description is required.");
+    if (!description) return show("bad","Description is required.");
 
     const c = compute();
-    if (!c.base || c.base <= 0) return show("bad", "Base must be greater than 0.");
+    if (!c.base || c.base <= 0) return show("bad","Base must be greater than 0.");
 
     const payload = {
       idkey: IDKEY,
       type: document.getElementById("type").value,
-      why: (document.getElementById("reason").value || "").trim(),
+      why: description,
       base_amount: c.base,
       tax_pct: c.taxPct,
-      grat_pct: c.gratPct,
+      grat_pct: c.gratPct
     };
-    payload.why = description + (payload.why ? " — " + payload.why : "");
 
     chargeBtn.disabled = true;
-    show("warn", "Processing…");
+    show("warn","Processing…");
 
     try {
-      const resp = await fetch(API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-charge-key": ADMIN_CHARGE_KEY,
+      const resp = await fetch(API_URL,{
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          "x-charge-key":ADMIN_CHARGE_KEY
         },
-        body: JSON.stringify(payload),
+        body:JSON.stringify(payload)
       });
 
-      const { text, json } = await readResponseAny(resp);
+      const json = await readResponse(resp);
 
       if (!resp.ok) {
-        const msg = json ? (json.error || JSON.stringify(json, null, 2)) : text || ("HTTP " + resp.status);
-        show("bad", msg);
+        show("bad", json.error || "Error");
         chargeBtn.disabled = false;
         return;
       }
 
-      // ✅ If backend says checkout fallback, go to Stripe checkout
-      if (json && json.ok && json.mode === "checkout" && json.checkout_url) {
+      if (json.mode === "checkout" && json.checkout_url) {
         window.location.href = json.checkout_url;
         return;
       }
 
-      if (json && json.ok) {
+      if (json.ok) {
         showSuccessAndClose();
         return;
       }
 
-      show("ok", (json ? JSON.stringify(json, null, 2) : text) || "SUCCESS");
-      showSuccessAndClose();
-    } catch (e) {
-      show("bad", "Failed: " + (e?.message || String(e)));
+      show("bad", json.error || "Unexpected response");
+      chargeBtn.disabled = false;
+
+    } catch(e){
+      show("bad","Failed: " + (e?.message || String(e)));
       chargeBtn.disabled = false;
     }
   });
 </script>
+</body>
+</html>
