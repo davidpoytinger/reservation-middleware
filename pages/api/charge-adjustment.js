@@ -3,9 +3,16 @@
 // POST /api/charge-adjustment
 // Admin endpoint to charge a saved payment method off-session (or create a Checkout Session fallback).
 //
-// IMPORTANT:
-// - We DO NOT insert a "success" transaction row here anymore.
-//   Stripe webhook (payment_intent.succeeded) is the single source of truth for successful charges.
+// ✅ CHANGES (reliability + debuggability):
+// - Stripe client uses higher network retries + timeout (reduces intermittent “connection to Stripe” failures)
+// - Adds SAFETY-NET transaction insert on successful OFF-SESSION charge
+//   (prevents “charge succeeded but no Caspio row” when webhook is delayed/missed)
+// - Keeps existing failure logging row behavior
+// - Returns idem_key for easier correlation/debugging
+//
+// NOTE:
+// - Webhook remains the preferred source of truth, but safety-net insert is idempotent and will not duplicate rows
+//   thanks to RawEventId = `pi_<payment_intent_id>` and your existing Stripe-ID dedupe logic.
 
 import Stripe from "stripe";
 import {
@@ -15,13 +22,14 @@ import {
   insertTransactionIfMissingByRawEventId,
 } from "../../lib/caspio";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2024-06-20",
+  maxNetworkRetries: 3,
+  timeout: 30000,
+});
 
 function setCors(req, res) {
-  const allowed = [
-    "https://reservebarsandrec.com",
-    "https://www.reservebarsandrec.com",
-  ];
+  const allowed = ["https://reservebarsandrec.com", "https://www.reservebarsandrec.com"];
 
   const origin = req.headers.origin;
   const allowOrigin = allowed.includes(origin) ? origin : allowed[0];
@@ -48,6 +56,10 @@ function oneLine(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
+function safeStripeErrorMessage(err) {
+  return err?.raw?.message || err?.message || "Stripe error";
+}
+
 export default async function handler(req, res) {
   setCors(req, res);
 
@@ -66,7 +78,7 @@ export default async function handler(req, res) {
       return json(res, 401, { ok: false, error: "Unauthorized (missing/invalid x-charge-key)" });
     }
 
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
     const idkey = oneLine(body.idkey);
     const type = oneLine(body.type || "Supplemental Fee") || "Supplemental Fee";
     const why = oneLine(body.why || "");
@@ -97,19 +109,24 @@ export default async function handler(req, res) {
 
     const formattedDescription = [type, why].filter(Boolean).join(" - ").slice(0, 500);
 
-    // touch reservation (optional)
+    // Touch reservation (optional)
     const where = buildWhereForIdKey(idkey);
     await updateReservationByWhere(where, { UpdatedAt: new Date().toISOString() }).catch(() => {});
 
     // Prefer off-session charge if we have a saved payment method
     if (stripeCustomerId && stripePaymentMethodId) {
       // Stable idempotency: same IDKEY + cents + description
-      const idemKey = [
-        "offsession",
+      const idemKey = ["offsession", idkey, String(totalCents), formattedDescription.slice(0, 60).replace(/\s+/g, "_")]
+        .join("_")
+        .slice(0, 255);
+
+      console.log("CHARGE_ADJ_START", {
         idkey,
-        String(totalCents),
-        formattedDescription.slice(0, 60).replace(/\s+/g, "_")
-      ].join("_").slice(0, 255);
+        totalCents,
+        hasCustomer: !!stripeCustomerId,
+        hasPaymentMethod: !!stripePaymentMethodId,
+      });
+      console.log("CHARGE_ADJ_IDEMPOTENCY", idemKey);
 
       let pi;
       try {
@@ -143,7 +160,16 @@ export default async function handler(req, res) {
           { idempotencyKey: idemKey }
         );
       } catch (err) {
-        const msg = err?.raw?.message || err?.message || "Stripe error";
+        console.error("CHARGE_ADJ_STRIPE_ERROR", {
+          message: err?.message,
+          type: err?.type,
+          code: err?.code,
+          statusCode: err?.statusCode,
+          requestId: err?.requestId || err?.raw?.requestId,
+          rawMessage: err?.raw?.message,
+        });
+
+        const msg = safeStripeErrorMessage(err);
 
         // Optional: log failure (does NOT roll up, since TxnType isn't charge/refund)
         await insertTransactionIfMissingByRawEventId({
@@ -156,6 +182,7 @@ export default async function handler(req, res) {
           StripePaymentIntentId: null,
           StripeChargeId: null,
           StripeCustomerId: String(stripeCustomerId),
+          StripePaymentMethodId: String(stripePaymentMethodId),
           Charge_Type: type,
           Description: formattedDescription,
           RawEventId: `supp_fail_${idkey}_${totalCents}_${Date.now()}`,
@@ -163,7 +190,43 @@ export default async function handler(req, res) {
           CreatedAt: new Date().toISOString(),
         }).catch(() => {});
 
-        return json(res, 402, { ok: false, error: msg });
+        return json(res, 402, { ok: false, error: msg, idem_key: idemKey });
+      }
+
+      // ✅ SAFETY-NET INSERT: ensures Caspio gets a row even if webhook is delayed/missed
+      // Idempotent via RawEventId + Stripe IDs
+      try {
+        await insertTransactionIfMissingByRawEventId({
+          IDKEY: String(idkey),
+          TxnType: "charge",
+
+          Base_Amount: round2(base),
+          Auto_Gratuity: round2(gratAmount),
+          Tax: round2(taxAmount),
+          Fee: 0,
+          Amount: round2(totalAmount),
+
+          Currency: "usd",
+          PaymentStatus: "Paid",
+          Status: pi?.status || "succeeded",
+
+          StripeCheckoutSessionId: null,
+          StripePaymentIntentId: pi?.id || null,
+          StripeChargeId: pi?.latest_charge?.id || null,
+          StripeCustomerId: String(stripeCustomerId),
+          StripePaymentMethodId: String(stripePaymentMethodId),
+
+          Charge_Type: type,
+          Description: formattedDescription,
+
+          // Stable per-PI idempotency key
+          RawEventId: `pi_${pi?.id}`,
+          Transaction_date: new Date().toISOString(),
+          CreatedAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn("SAFETY_NET_TXN_INSERT_FAILED", e?.message || e);
+        // Non-blocking: charge succeeded; webhook may still insert
       }
 
       return json(res, 200, {
@@ -172,6 +235,7 @@ export default async function handler(req, res) {
         payment_intent_id: pi?.id || null,
         status: pi?.status || "unknown",
         amount: totalAmount,
+        idem_key: idemKey,
       });
     }
 
