@@ -3,10 +3,9 @@
 // POST /api/charge-adjustment
 // Admin endpoint to charge a saved payment method off-session (or create a Checkout Session fallback).
 //
-// IMPORTANT CHANGE:
+// IMPORTANT:
 // - We DO NOT insert a "success" transaction row here anymore.
-//   The Stripe webhook (payment_intent.succeeded) is the single source of truth for successful charges,
-//   and it will write Base_Amount / Auto_Gratuity / Tax / Fee + rollups.
+//   Stripe webhook (payment_intent.succeeded) is the single source of truth for successful charges.
 
 import Stripe from "stripe";
 import {
@@ -31,6 +30,13 @@ function setCors(req, res) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-charge-key");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
+function json(res, status, payload) {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(status).send(JSON.stringify(payload));
 }
 
 function round2(n) {
@@ -38,31 +44,44 @@ function round2(n) {
   return Number.isFinite(x) ? Number(x.toFixed(2)) : 0;
 }
 
+function oneLine(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
 export default async function handler(req, res) {
   setCors(req, res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
-  const adminKey = process.env.ADMIN_CHARGE_KEY || "";
-  const provided = String(req.headers["x-charge-key"] || "");
-  if (!adminKey || provided !== adminKey) return res.status(401).send("Unauthorized");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method Not Allowed" });
 
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return json(res, 500, { ok: false, error: "Missing STRIPE_SECRET_KEY" });
+    }
 
-    const idkey = String(body.idkey || "").trim();
-    const type = String(body.type || "Supplemental Fee").trim();
-    const why = String(body.why || "").trim();
+    const adminKey = String(process.env.ADMIN_CHARGE_KEY || "").trim();
+    const provided = String(req.headers["x-charge-key"] || "").trim();
+
+    if (!adminKey || provided !== adminKey) {
+      return json(res, 401, { ok: false, error: "Unauthorized (missing/invalid x-charge-key)" });
+    }
+
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const idkey = oneLine(body.idkey);
+    const type = oneLine(body.type || "Supplemental Fee") || "Supplemental Fee";
+    const why = oneLine(body.why || "");
     const base = round2(body.base_amount);
     const taxRate = round2(body.tax_pct);
     const gratRate = round2(body.grat_pct);
 
-    if (!idkey) return res.status(400).send("Missing idkey");
-    if (!base || base <= 0) return res.status(400).send("Missing/invalid base_amount");
+    if (!idkey) return json(res, 400, { ok: false, error: "Missing idkey" });
+    if (!base || base <= 0) return json(res, 400, { ok: false, error: "Missing/invalid base_amount" });
 
     const reservation = await getReservationByIdKey(idkey);
-    const stripeCustomerId = String(reservation.StripeCustomerId || "").trim();
-    const stripePaymentMethodId = String(reservation.StripePaymentMethodId || "").trim();
+    if (!reservation) return json(res, 404, { ok: false, error: "Reservation not found for IDKEY" });
+
+    const stripeCustomerId = oneLine(reservation.StripeCustomerId);
+    const stripePaymentMethodId = oneLine(reservation.StripePaymentMethodId);
 
     const resId =
       reservation.RES_ID ??
@@ -78,15 +97,19 @@ export default async function handler(req, res) {
 
     const formattedDescription = [type, why].filter(Boolean).join(" - ").slice(0, 500);
 
-    // Update reservation record with latest computed amounts (optional)
+    // touch reservation (optional)
     const where = buildWhereForIdKey(idkey);
-    await updateReservationByWhere(where, {
-      UpdatedAt: new Date().toISOString(),
-    }).catch(() => {});
+    await updateReservationByWhere(where, { UpdatedAt: new Date().toISOString() }).catch(() => {});
 
     // Prefer off-session charge if we have a saved payment method
     if (stripeCustomerId && stripePaymentMethodId) {
-      const idemKey = `offsession_${idkey}_${totalCents}_${Date.now()}`.slice(0, 255);
+      // Stable idempotency: same IDKEY + cents + description
+      const idemKey = [
+        "offsession",
+        idkey,
+        String(totalCents),
+        formattedDescription.slice(0, 60).replace(/\s+/g, "_")
+      ].join("_").slice(0, 255);
 
       let pi;
       try {
@@ -140,11 +163,10 @@ export default async function handler(req, res) {
           CreatedAt: new Date().toISOString(),
         }).catch(() => {});
 
-        return res.status(402).json({ ok: false, error: msg });
+        return json(res, 402, { ok: false, error: msg });
       }
 
-      // Success response — webhook will insert the actual txn + rollup
-      return res.status(200).json({
+      return json(res, 200, {
         ok: true,
         mode: "off_session",
         payment_intent_id: pi?.id || null,
@@ -153,7 +175,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Fallback: create a Checkout Session if no saved payment method
+    // Fallback: Checkout Session if no saved payment method
     const allowedOrigin = process.env.ALLOWED_ORIGIN || "https://reservebarsandrec.com";
     const successUrl = `${allowedOrigin}/charge-tool-success.html?idkey=${encodeURIComponent(idkey)}`;
     const cancelUrl = `${allowedOrigin}/charge-tool-cancel.html?idkey=${encodeURIComponent(idkey)}`;
@@ -204,7 +226,7 @@ export default async function handler(req, res) {
       cancel_url: cancelUrl,
     });
 
-    return res.status(200).json({
+    return json(res, 200, {
       ok: true,
       mode: "checkout",
       checkout_url: session.url,
@@ -212,7 +234,8 @@ export default async function handler(req, res) {
       amount: totalAmount,
     });
   } catch (err) {
-    console.error("CHARGE_ADJUSTMENT_FAILED", err?.message || err);
-    return res.status(500).send(err?.message || "Server error");
+    const msg = err?.message || String(err || "Server error");
+    console.error("CHARGE_ADJUSTMENT_FAILED", msg);
+    return json(res, 500, { ok: false, error: msg });
   }
 }
