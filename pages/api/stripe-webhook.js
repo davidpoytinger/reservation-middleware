@@ -1,12 +1,14 @@
 // pages/api/stripe-webhook.js
 //
 // Debug-enabled Stripe webhook for SIGMA
-// - Keeps "one transaction per successful checkout" behavior
-// - Off-session PI logging is gated by metadata.source === "off_session"
-// - Removes RES_ID from transaction inserts
-// - Rolls up totals (no UpdatedAt expected in rollup table)
+// - "one transaction per successful checkout" behavior
+// - Off-session PI logging gated by metadata.source === "off_session"
+// - Rolls up totals
 //
-// NOTE: Enrichment (Email_Design / branding fields) moved to sigma-rollup-total-res.js
+// FIXES:
+// ✅ Resilient transaction insert (ColumnNotFound -> drop fields -> retry)
+// ✅ PaymentStatus set by metadata.purpose (booking_fee vs supplemental)
+// ✅ Better Description selection from metadata
 
 import Stripe from "stripe";
 import {
@@ -60,8 +62,33 @@ async function updateReservationResilient(where, payload) {
     for (const f of missing) delete trimmed[f];
     if (Object.keys(trimmed).length === 0) throw err;
 
-    console.warn("⚠️ Caspio ColumnNotFound. Retrying without fields:", missing);
+    console.warn("⚠️ Reservation ColumnNotFound. Retrying without fields:", missing);
     return await updateReservationByWhere(where, trimmed);
+  }
+}
+
+/**
+ * ✅ NEW: Resilient TXN insert wrapper (same ColumnNotFound retry pattern).
+ * This prevents “success but no row” when your TXN table lacks certain columns.
+ */
+async function insertTxnResilient(txnPayload) {
+  try {
+    return await insertTransactionIfMissingByRawEventId(txnPayload);
+  } catch (err) {
+    const msg = String(err?.message || "");
+    if (!/ColumnNotFound/i.test(msg) && !/do not exist/i.test(msg)) throw err;
+
+    const after = msg.split("do not exist:")[1] || "";
+    const missing = [];
+    for (const m of after.matchAll(/'([^']+)'/g)) missing.push(m[1]);
+    if (!missing.length) throw err;
+
+    const trimmed = { ...txnPayload };
+    for (const f of missing) delete trimmed[f];
+    if (Object.keys(trimmed).length === 0) throw err;
+
+    console.warn("⚠️ TXN ColumnNotFound. Retrying without fields:", missing);
+    return await insertTransactionIfMissingByRawEventId(trimmed);
   }
 }
 
@@ -69,7 +96,6 @@ function getIdKeyFromMetadata(meta) {
   return meta?.IDKEY || meta?.reservation_id || meta?.idkey || meta?.IdKey || null;
 }
 
-// Safely read Confirmation_Number from reservation row
 function getConfirmationNumberFromReservationRow(row) {
   return row?.Confirmation_Number || row?.ConfirmationNumber || row?.CONFIRMATION_NUMBER || null;
 }
@@ -85,8 +111,6 @@ function getConfirmationNumberFromReservationRow(row) {
  */
 function parseBreakdown(meta, totalAmountDollars) {
   const m = meta || {};
-
-  // Accept multiple key styles
   const baseRaw = m.base_amount ?? m.baseAmount ?? m.Base_Amount ?? m.base ?? m.Base ?? null;
 
   const gratRaw =
@@ -99,7 +123,6 @@ function parseBreakdown(meta, totalAmountDollars) {
     null;
 
   const taxRaw = m.tax_amount ?? m.taxAmount ?? m.Tax ?? m.tax ?? null;
-
   const feeRaw = m.fee_amount ?? m.feeAmount ?? m.Fee ?? m.fee ?? null;
 
   const hasAny = baseRaw != null || gratRaw != null || taxRaw != null || feeRaw != null;
@@ -113,9 +136,28 @@ function parseBreakdown(meta, totalAmountDollars) {
     return { base, grat, tax, fee, amount };
   }
 
-  // Legacy fallback: all in Fee
   const total = n2(totalAmountDollars);
   return { base: 0, grat: 0, tax: 0, fee: total, amount: total };
+}
+
+function pickDescription(meta = {}, fallback = "") {
+  return String(
+    meta.Description ||
+    meta.description ||
+    meta.why ||
+    meta.Reason ||
+    meta.reason ||
+    meta.Sessions_Title ||
+    meta.People_Text ||
+    fallback ||
+    ""
+  ).slice(0, 500);
+}
+
+function paymentStatusFromPurpose(purpose, defaultPaid = "Paid") {
+  const p = String(purpose || "").toLowerCase();
+  if (p === "booking_fee") return "PaidBookingFee";
+  return defaultPaid;
 }
 
 async function safeRollup(idkey) {
@@ -144,7 +186,6 @@ export default async function handler(req, res) {
   console.log("STRIPE_EVENT:", event?.type, "EVENT_ID:", event?.id);
 
   try {
-    // Cache reservation row per webhook execution
     let reservationCache = null;
 
     async function getReservationCached(idkey) {
@@ -155,7 +196,7 @@ export default async function handler(req, res) {
     }
 
     // ------------------------------------------------------------
-    // 1) CHECKOUT COMPLETED  (ONLY source for checkout payments)
+    // 1) CHECKOUT COMPLETED  (source for checkout payments)
     // ------------------------------------------------------------
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
@@ -164,10 +205,6 @@ export default async function handler(req, res) {
       if (!idkey) return res.status(200).json({ received: true });
 
       console.log("CHECKOUT_COMPLETED_IDKEY:", String(idkey));
-
-      const metaChargeType = session?.metadata?.Charge_Type || null;
-      const metaSessionsTitle = session?.metadata?.Sessions_Title || null;
-      const metaPeopleText = session?.metadata?.People_Text || null;
 
       const fullSession = await stripe.checkout.sessions.retrieve(session.id, {
         expand: ["customer", "payment_intent"],
@@ -202,7 +239,10 @@ export default async function handler(req, res) {
 
       const where = `IDKEY='${escapeWhereValue(idkey)}'`;
 
-      // Reservation update payload (payment fields only)
+      // Update reservation record (best-effort)
+      const mdSession = fullSession?.metadata || session?.metadata || {};
+      const metaChargeType = mdSession?.Charge_Type || null;
+
       const payload = {
         BookingFeePaidAt: paidAtIso,
         StripeCheckoutSessionId: fullSession.id,
@@ -220,21 +260,29 @@ export default async function handler(req, res) {
         Transaction_date: paidAtIso,
       };
 
+      // Carry optional metadata fields
       if (metaChargeType) payload.Charge_Type = metaChargeType;
-      if (metaSessionsTitle) payload.Sessions_Title = metaSessionsTitle;
-      if (metaPeopleText) payload.People_Text = metaPeopleText;
+      if (mdSession?.Sessions_Title) payload.Sessions_Title = mdSession.Sessions_Title;
+      if (mdSession?.People_Text) payload.People_Text = mdSession.People_Text;
 
       await updateReservationResilient(where, payload);
 
-      // Pull reservation once for Charge_Type fallback + Confirmation_Number
+      // Reservation row for Confirmation_Number fallback
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      const mdSession = fullSession?.metadata || session?.metadata || {};
       const breakdown = parseBreakdown(mdSession, amountDollars);
 
-      let reservationChargeType = metaChargeType;
-      if (!reservationChargeType) reservationChargeType = reservationRow?.Charge_Type || "booking_fee";
+      const purpose = mdSession?.purpose || mdSession?.Purpose || null;
+      const paymentStatus = paymentStatusFromPurpose(purpose, "Paid");
+
+      const chargeType =
+        metaChargeType ||
+        mdSession?.Charge_Type ||
+        reservationRow?.Charge_Type ||
+        String(purpose || "checkout_charge");
+
+      const description = pickDescription(mdSession, chargeType);
 
       const txnPayload = {
         IDKEY: String(idkey),
@@ -247,7 +295,7 @@ export default async function handler(req, res) {
         Amount: breakdown.amount,
 
         Currency: currency,
-        PaymentStatus: "PaidBookingFee",
+        PaymentStatus: paymentStatus,
         Status: paymentIntent?.status || "succeeded",
 
         StripeCheckoutSessionId: fullSession.id,
@@ -256,17 +304,22 @@ export default async function handler(req, res) {
         StripeCustomerId: stripeCustomerId,
         StripePaymentMethodId: stripePaymentMethodId,
 
-        Charge_Type: reservationChargeType,
-        Description: reservationChargeType,
+        Charge_Type: String(chargeType).slice(0, 250),
+        Description: description,
 
         Confirmation_Number: confirmationNumber,
+
+        // optional card fields (will be dropped if columns don't exist)
+        Card_brand: card?.brand || null,
+        Card_number_masked: card?.last4 ? `**** **** **** ${card.last4}` : null,
+        Card_expiration: card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
 
         RawEventId: String(event.id),
         Transaction_date: paidAtIso,
         CreatedAt: new Date().toISOString(),
       };
 
-      await insertTransactionIfMissingByRawEventId(txnPayload).catch((e) =>
+      await insertTxnResilient(txnPayload).catch((e) =>
         console.error("⚠️ TXN_INSERT_FAILED", e?.message || e)
       );
 
@@ -311,13 +364,17 @@ export default async function handler(req, res) {
           ? piFull.payment_method
           : piFull?.payment_method?.id || charge?.payment_method || null;
 
-      const chargeType = piFull?.metadata?.Charge_Type || "supplemental_charge";
-      const description = piFull?.metadata?.Description || chargeType;
-
       const reservationRow = await getReservationCached(idkey);
       const confirmationNumber = getConfirmationNumberFromReservationRow(reservationRow);
 
-      const breakdown = parseBreakdown(piFull?.metadata || {}, amountDollars);
+      const md = piFull?.metadata || {};
+      const breakdown = parseBreakdown(md, amountDollars);
+
+      const purpose = md?.purpose || md?.Purpose || null;
+      const paymentStatus = paymentStatusFromPurpose(purpose, "Paid");
+
+      const chargeType = md?.Charge_Type || "supplemental_charge";
+      const description = pickDescription(md, chargeType);
 
       const txnPayload = {
         IDKEY: String(idkey),
@@ -330,7 +387,7 @@ export default async function handler(req, res) {
         Amount: breakdown.amount,
 
         Currency: currency,
-        PaymentStatus: "Paid",
+        PaymentStatus: paymentStatus,
         Status: piFull?.status || "succeeded",
 
         StripeCheckoutSessionId: null,
@@ -339,11 +396,12 @@ export default async function handler(req, res) {
         StripeCustomerId: stripeCustomerId,
         StripePaymentMethodId: stripePaymentMethodId,
 
-        Charge_Type: chargeType,
+        Charge_Type: String(chargeType).slice(0, 250),
         Description: description,
 
         Confirmation_Number: confirmationNumber,
 
+        // optional card fields (will be dropped if columns don't exist)
         Card_brand: card?.brand || null,
         Card_number_masked: card?.last4 ? `**** **** **** ${card.last4}` : null,
         Card_expiration: card?.exp_month && card?.exp_year ? `${card.exp_month}/${card.exp_year}` : null,
@@ -353,7 +411,7 @@ export default async function handler(req, res) {
         CreatedAt: new Date().toISOString(),
       };
 
-      await insertTransactionIfMissingByRawEventId(txnPayload).catch((e) =>
+      await insertTxnResilient(txnPayload).catch((e) =>
         console.error("⚠️ TXN_INSERT_FAILED", e?.message || e)
       );
 
@@ -437,7 +495,7 @@ export default async function handler(req, res) {
         CreatedAt: new Date().toISOString(),
       };
 
-      await insertTransactionIfMissingByRawEventId(txnPayload).catch((e) =>
+      await insertTxnResilient(txnPayload).catch((e) =>
         console.error("⚠️ TXN_INSERT_FAILED", e?.message || e)
       );
 
@@ -448,6 +506,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ received: true });
   } catch (err) {
+    // Still returning 200 to avoid Stripe retries, but now you'll see the true error in logs.
     console.error("❌ WEBHOOK_FAILED", err?.message || err);
     return res.status(200).json({ received: true });
   }
