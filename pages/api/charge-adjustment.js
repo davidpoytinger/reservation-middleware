@@ -1,19 +1,10 @@
 // pages/api/charge-adjustment.js
 //
-// POST /api/charge-adjustment
-// Admin endpoint to charge a saved payment method off-session (or create a Checkout Session fallback).
+// DROP-IN REPLACEMENT ✅
+// - Keeps everything you already have
+// - ✅ Adds rollupTotalsForIdKey after successful safety-net inserts (normal + recovered paths)
+// - ✅ Adds resilient rollup wrapper (non-blocking, logs failures)
 //
-// ✅ Updates included:
-// 1) Stripe client hardened: maxNetworkRetries + timeout
-// 2) Safety-net: on successful off-session PI, insert a Caspio TXN row immediately (idempotent)
-// 3) Recovery: if Stripe returns a "connection" error, attempt to find the PI via Stripe Search
-//    (using metadata.idem_key) and treat as success if found.
-// 4) Failure logging preserved: inserts AdjustmentFailed row when unrecoverable.
-//
-// Notes:
-// - Webhook can still insert; dedupe prevents duplicates (RawEventId pi_<pi.id> + Stripe IDs).
-// - Requires Stripe Search API (enabled on most accounts).
-// - Your UI should still handle mode === "checkout" by redirecting to checkout_url.
 
 import Stripe from "stripe";
 import {
@@ -21,6 +12,7 @@ import {
   updateReservationByWhere,
   buildWhereForIdKey,
   insertTransactionIfMissingByRawEventId,
+  rollupTotalsForIdKey, // ✅ ADDED
 } from "../../lib/caspio";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
@@ -79,6 +71,24 @@ function escapeStripeSearchString(s) {
   return String(s || "").replace(/'/g, "\\'");
 }
 
+// ✅ NEW: Safe rollup wrapper (non-blocking)
+async function safeRollup(idkey) {
+  if (!idkey) return;
+  try {
+    await rollupTotalsForIdKey(String(idkey));
+    console.log("ROLLUP_OK:", String(idkey));
+  } catch (e) {
+    console.warn("⚠️ ROLLUP_FAILED (non-blocking)", e?.message || e);
+  }
+}
+
+function getLatestChargeId(piFull) {
+  const lc = piFull?.latest_charge;
+  if (!lc) return null;
+  if (typeof lc === "string") return lc;
+  return lc?.id || null;
+}
+
 async function safetyNetInsertCharge({
   idkey,
   base,
@@ -107,7 +117,7 @@ async function safetyNetInsertCharge({
 
     StripeCheckoutSessionId: null,
     StripePaymentIntentId: piFull?.id || null,
-    StripeChargeId: piFull?.latest_charge?.id || null,
+    StripeChargeId: getLatestChargeId(piFull),
     StripeCustomerId: String(stripeCustomerId || ""),
     StripePaymentMethodId: String(stripePaymentMethodId || ""),
 
@@ -228,6 +238,9 @@ export default async function handler(req, res) {
           piFull: pi,
         }).catch((e) => console.warn("SAFETY_NET_TXN_INSERT_FAILED", e?.message || e));
 
+        // ✅ NEW: rollup immediately so “Payments Applied” updates even if webhook lags/fails
+        await safeRollup(idkey);
+
         return json(res, 200, {
           ok: true,
           mode: "off_session",
@@ -266,6 +279,9 @@ export default async function handler(req, res) {
                 description: formattedDescription,
                 piFull,
               }).catch((e) => console.warn("SAFETY_NET_TXN_INSERT_FAILED", e?.message || e));
+
+              // ✅ NEW: rollup immediately after recovered insert
+              await safeRollup(idkey);
 
               return json(res, 200, {
                 ok: true,
