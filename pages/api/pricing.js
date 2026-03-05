@@ -1,4 +1,5 @@
-// pages/api/pricing.js
+// pages/api/pricing.js (DROP-IN REPLACEMENT ✅)
+// ✅ Backwards compatible query params: price_status | Price_Status | priceStatus | ps
 import { listViewRecordsByWhere, escapeWhereValue } from "../../lib/caspio";
 
 function setCors(res, origin) {
@@ -6,19 +7,12 @@ function setCors(res, origin) {
     "https://www.reservebarsandrec.com",
     "https://reservebarsandrec.com",
   ]);
-
-  // Optional: if you test in Weebly preview, uncomment these:
-  // allowed.add("https://www.weebly.com");
-  // allowed.add("https://editor.weebly.com");
-
   const allowOrigin = allowed.has(origin) ? origin : "https://www.reservebarsandrec.com";
-
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
-
 
 const TTL_MS = 60 * 60 * 1000; // 60 minutes
 const cache = new Map();
@@ -36,15 +30,30 @@ function cacheSet(key, data) {
 export default async function handler(req, res) {
   setCors(res, req.headers.origin);
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "GET") return res.status(405).send("Method not allowed");
+  if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method not allowed" });
 
   try {
-    const priceStatus = String(req.query.price_status || "").trim();
+    const priceStatus =
+      String(
+        req.query.price_status ||
+        req.query.Price_Status ||
+        req.query.priceStatus ||
+        req.query.ps ||
+        ""
+      ).trim();
+
     if (!priceStatus) return res.status(400).json({ ok: false, error: "Missing price_status" });
 
+    // allow bypass cache with ?nocache=1
+    const nocache = String(req.query.nocache || "") === "1";
+
     const cacheKey = `pricing:${priceStatus}`;
-    const cached = cacheGet(cacheKey);
-    if (cached) return res.status(200).json({ ok: true, cached: true, rows: cached });
+    if(!nocache){
+      const cached = cacheGet(cacheKey);
+      if (cached) return res.status(200).json({ ok: true, cached: true, rows: cached });
+    } else {
+      res.setHeader("Cache-Control", "no-store");
+    }
 
     const view = process.env.CASPIO_PRICING_VIEW || "SIGMA_VW_Pricing";
     const where = `Price_Status='${escapeWhereValue(priceStatus)}'`;
@@ -68,7 +77,7 @@ export default async function handler(req, res) {
       return ap - bp;
     });
 
-    cacheSet(cacheKey, rows);
+    if(!nocache) cacheSet(cacheKey, rows);
     return res.status(200).json({ ok: true, cached: false, rows });
   } catch (err) {
     console.error("PRICING_ERROR:", err?.message || err);
