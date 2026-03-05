@@ -1,78 +1,90 @@
 // pages/api/caspio-token.js
-//
-// Returns a Caspio OAuth token for client-side calls.
-// CORS-safe for site + sandboxed embeds (Origin: null).
-
 export default async function handler(req, res) {
-  // ---- CORS ----
-  const allowed = new Set([
-    "https://www.reservebarsandrec.com",
-    "https://reservebarsandrec.com",
-  ]);
-
-  const origin = req.headers.origin || "";
-
-  // Sandbox/preview embeds sometimes send Origin: null.
-  // This route does not use cookies/credentials, so wildcard is OK.
-  let allowOrigin;
-  if (!origin || origin === "null") {
-    allowOrigin = "*";
-  } else if (allowed.has(origin)) {
-    allowOrigin = origin;
-  } else {
-    allowOrigin = "https://www.reservebarsandrec.com";
-  }
-
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  if (allowOrigin !== "*") res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+  // CORS (optional)
+  const origin = req.headers.origin || "*";
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const clientId = process.env.CASPIO_CLIENT_ID;
-    const clientSecret = process.env.CASPIO_CLIENT_SECRET;
+    const CASPIO_TOKEN_URL = process.env.CASPIO_TOKEN_URL;
+    const CASPIO_CLIENT_ID = process.env.CASPIO_CLIENT_ID;
+    const CASPIO_CLIENT_SECRET = process.env.CASPIO_CLIENT_SECRET;
 
-    if (!clientId || !clientSecret) {
-      return res
-        .status(500)
-        .json({ error: "Missing CASPIO_CLIENT_ID or CASPIO_CLIENT_SECRET" });
+    // Hard fail with JSON (never HTML)
+    const missing = [];
+    if (!CASPIO_TOKEN_URL) missing.push("CASPIO_TOKEN_URL");
+    if (!CASPIO_CLIENT_ID) missing.push("CASPIO_CLIENT_ID");
+    if (!CASPIO_CLIENT_SECRET) missing.push("CASPIO_CLIENT_SECRET");
+    if (missing.length) {
+      return res.status(500).json({
+        ok: false,
+        error: "MISSING_ENV",
+        missing,
+      });
     }
 
-    const tokenUrl = "https://c0gfs257.caspio.com/oauth/token";
+    // Caspio token endpoint MUST end with /oauth/token
+    // (we won't force it, but we will report it)
+    const url = String(CASPIO_TOKEN_URL).trim();
 
-    const body = new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: clientId,
-      client_secret: clientSecret,
-    });
+    const body = new URLSearchParams();
+    body.set("grant_type", "client_credentials");
+    body.set("client_id", CASPIO_CLIENT_ID);
+    body.set("client_secret", CASPIO_CLIENT_SECRET);
 
-    const r = await fetch(tokenUrl, {
+    const upstream = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
     });
 
-    const j = await r.json();
+    const ct = upstream.headers.get("content-type") || "";
+    const text = await upstream.text();
 
-    if (!r.ok) {
-      return res.status(r.status).json({
-        error: "Caspio token request failed",
-        details: j,
+    // Try parse only if it looks like JSON
+    const looksJson = ct.includes("application/json") || text.trim().startsWith("{");
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        ok: false,
+        error: "CASPIO_TOKEN_UPSTREAM_NOT_OK",
+        token_url: url,
+        token_url_endswith_oauth_token: url.endsWith("/oauth/token"),
+        upstream_status: upstream.status,
+        upstream_content_type: ct,
+        upstream_body_preview: text.slice(0, 600),
       });
     }
 
+    if (!looksJson) {
+      return res.status(502).json({
+        ok: false,
+        error: "CASPIO_TOKEN_UPSTREAM_NOT_JSON",
+        token_url: url,
+        token_url_endswith_oauth_token: url.endsWith("/oauth/token"),
+        upstream_status: upstream.status,
+        upstream_content_type: ct,
+        upstream_body_preview: text.slice(0, 600),
+      });
+    }
+
+    const json = JSON.parse(text);
+
+    // standard success payload
     return res.status(200).json({
-      access_token: j.access_token,
-      expires_in: j.expires_in,
-      token_type: j.token_type,
+      ...json,
+      ok: true,
     });
-  } catch (e) {
+  } catch (err) {
+    console.error("CASPIO_TOKEN_ROUTE_ERROR:", err);
     return res.status(500).json({
+      ok: false,
       error: "Server error",
-      details: String(e?.message || e),
+      details: err?.message || String(err),
     });
   }
 }
