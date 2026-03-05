@@ -1,83 +1,77 @@
-<script>
-(function(){
-  /* =========================
-     Booking Summary Script (PROXY)
-     - No Caspio calls in browser
-     - Calls Vercel: /api/booking-summary
-  ========================= */
+// pages/api/booking-summary.js
+//
+// ✅ Browser-safe Booking Summary proxy
+// Browser calls this route; server calls Caspio using CASPIO_INTEGRATION_URL + cached token.
+//
+// GET /api/booking-summary?idkey=XXXX
+// Optional: &nocache=1
 
-  const API_BASE = "https://reservation-middleware2.vercel.app";
-  const money = (n) => {
-    const v = Number(n || 0);
-    return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(v);
-  };
-  const safeText = (v) => (v == null ? "" : String(v));
+import { caspioFetch, escapeWhereValue } from "../../lib/caspio";
 
-  const prettyDate = (v) => {
-    if (!v) return "";
-    const s = String(v);
-    const d = new Date(s);
-    if (isNaN(d.getTime())) return s;
-    return d.toLocaleDateString("en-US", {
-      weekday: "short",
-      month: "numeric",
-      day: "numeric",
-      year: "numeric",
-    });
-  };
+function setCors(req, res) {
+  const allowed = new Set([
+    "https://www.reservebarsandrec.com",
+    "https://reservebarsandrec.com",
+  ]);
 
-  function getIdkeyFromUrl() {
-    const p = new URLSearchParams(window.location.search);
-    return p.get("IDKEY") || p.get("idkey") || p.get("Idkey") || p.get("id") || "";
-  }
+  const origin = req.headers.origin || "";
+  const allowOrigin = allowed.has(origin)
+    ? origin
+    : "https://www.reservebarsandrec.com";
 
-  async function fetchSummary(idkey, opts={}) {
-    const nocache = opts.nocache ? "&nocache=1" : "";
-    const url = `${API_BASE}/api/booking-summary?idkey=${encodeURIComponent(idkey)}${nocache}`;
-    const r = await fetch(url, { cache: "no-store" });
-    const text = await r.text();
-    let j = {};
-    try { j = text ? JSON.parse(text) : {}; } catch {}
-    if (!r.ok || !j.ok) throw new Error(j?.error || text || "Summary fetch failed");
-    return j.row || null;
-  }
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
 
-  function render(row) {
-    const el = document.getElementById("sigmaBookingSummary");
-    if (!row) { if (el) el.style.display = "none"; return; }
-    if (el) el.style.display = "block";
+export default async function handler(req, res) {
+  setCors(req, res);
 
-    document.getElementById("bs_session_date").textContent = prettyDate(row.BAR2_Session_Date);
-    document.getElementById("bs_session_title").textContent = safeText(row.BAR2_Session_Title);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "GET")
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-    document.getElementById("bs_primary_subtotal").textContent = money(row.SIGMA_BAR3_TOTAL_RES_Subtotal_Primary);
-    document.getElementById("bs_addon_subtotal").textContent = money(row.SIGMA_BAR3_TOTAL_RES_Subtotal_Addon);
-    document.getElementById("bs_gratuity").textContent = money(row.SIGMA_BAR3_TOTAL_RES_Subtotal_Gratuity);
-    document.getElementById("bs_tax").textContent = money(row.SIGMA_BAR3_TOTAL_RES_TAX_Amount);
-    document.getElementById("bs_total").textContent = money(row.SIGMA_BAR3_TOTAL_RES_After_Tax_Total);
-    document.getElementById("bs_paid").textContent = money(row.SIGMA_BAR3_TOTAL_RES_Total_Charged_Amount);
-  }
+  try {
+    const idkey = String(req.query.idkey || req.query.IDKEY || "").trim();
+    if (!idkey) return res.status(400).json({ ok: false, error: "Missing idkey" });
 
-  async function load(nocache=false) {
-    const idkey = getIdkeyFromUrl();
-    if (!idkey) return;
-    try {
-      const row = await fetchSummary(idkey, { nocache });
-      render(row);
-    } catch (e) {
-      console.error("Booking Summary proxy error:", e);
-      // leave visible but stale rather than hiding; comment out if you prefer hiding
-      // document.getElementById("sigmaBookingSummary").style.display = "none";
+    // Caching:
+    // Default: short edge cache for speed; allow bypass with ?nocache=1
+    const nocache = String(req.query.nocache || "") === "1";
+    if (nocache) {
+      res.setHeader("Cache-Control", "no-store");
+    } else {
+      res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=60");
     }
+
+    const safe = escapeWhereValue(idkey);
+    const where = `IDKEY='${safe}'`;
+
+    // Only pull fields your Booking Summary UI needs
+    const select = [
+      "BAR2_Session_Date",
+      "BAR2_Session_Title",
+      "SIGMA_BAR3_TOTAL_RES_Subtotal_Primary",
+      "SIGMA_BAR3_TOTAL_RES_Subtotal_Addon",
+      "SIGMA_BAR3_TOTAL_RES_Subtotal_Gratuity",
+      "SIGMA_BAR3_TOTAL_RES_TAX_Amount",
+      "SIGMA_BAR3_TOTAL_RES_After_Tax_Total",
+      "SIGMA_BAR3_TOTAL_RES_Total_Charged_Amount",
+    ].join(",");
+
+    const path =
+      `/rest/v2/views/SIGMA_VW_Res_Billing_Edit/records` +
+      `?q.where=${encodeURIComponent(where)}` +
+      `&q.limit=1` +
+      `&q.select=${encodeURIComponent(select)}`;
+
+    const json = await caspioFetch(path);
+
+    const row = json?.Result?.[0] || null;
+    return res.status(200).json({ ok: true, row });
+  } catch (e) {
+    console.error("booking-summary error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || "Server error" });
   }
-
-  // Initial load
-  document.addEventListener("DOMContentLoaded", () => load(false));
-
-  // Optional: let other scripts refresh us without reloading the page
-  window.addEventListener("sigma:refreshTotals", () => load(true));
-
-  // Optional: expose a tiny manual hook
-  window.SIGMA_REFRESH_BOOKING_SUMMARY = () => load(true);
-})();
-</script>
+}
