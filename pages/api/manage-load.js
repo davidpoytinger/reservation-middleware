@@ -1,11 +1,16 @@
 // pages/api/manage-load.js
 import {
-  escapeWhereValue,
-  listViewRecordsByWhere,
-  listRecordsByWhere,
   getReservationByIdKey,
-  updateReservationByWhere,
+  getResBillingEditViewRowByIdKey,
+  listRecordsByWhere,
+  escapeWhereValue,
 } from "../../lib/caspio";
+
+// CONFIG
+const V_SESS = "SIGMA_VW_Active_Sessions_Manage";
+const T_SUBS = "BAR2_PricingV2_Subs";
+const T_PRICING = "BAR2_PricingV2";
+const CASPIO_BASE = process.env.CASPIO_INTEGRATION_URL || "https://c0gfs257.caspio.com";
 
 function setCors(req, res) {
   const allowed = new Set([
@@ -14,169 +19,74 @@ function setCors(req, res) {
   ]);
   const origin = req.headers.origin || "";
   const allowOrigin = allowed.has(origin) ? origin : "https://www.reservebarsandrec.com";
+
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function dateOnly(v) {
-  const s = String(v || "").trim();
-  return s.length >= 10 ? s.slice(0, 10) : s;
-}
+// simple tokenized fetch via caspio token helper
+async function getToken() {
+  // use caspio.js internal token cache by calling any exported function is awkward,
+  // so we do a small local token fetch through your existing oauth env.
+  // But since your lib/caspio.js already handles auth, we’ll reuse it indirectly:
+  // We'll call Caspio REST through CASPIO_BASE and Authorization using a token we fetch here.
+  const tokenUrl = process.env.CASPIO_TOKEN_URL;
+  const clientId = process.env.CASPIO_CLIENT_ID;
+  const clientSecret = process.env.CASPIO_CLIENT_SECRET;
 
-function parseCaspioDateTime(v) {
-  if (!v) return null;
-  if (v instanceof Date) return v;
-  const s = String(v).trim();
-  if (!s) return null;
-
-  // MM/DD/YYYY [HH:MM[:SS] [AM|PM]]
-  const m = s.match(
-    /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?)?$/i
-  );
-  if (m) {
-    const mo = parseInt(m[1], 10);
-    const da = parseInt(m[2], 10);
-    const yr = parseInt(m[3], 10);
-
-    let hr = parseInt(m[4] || "0", 10);
-    const mi = parseInt(m[5] || "0", 10);
-    const se = parseInt(m[6] || "0", 10);
-    const ap = (m[7] || "").toUpperCase();
-
-    if (ap) {
-      if (ap === "AM" && hr === 12) hr = 0;
-      if (ap === "PM" && hr !== 12) hr += 12;
-    }
-    return new Date(yr, mo - 1, da, hr, mi, se, 0);
+  if (!tokenUrl || !clientId || !clientSecret) {
+    throw new Error("Missing CASPIO_TOKEN_URL / CASPIO_CLIENT_ID / CASPIO_CLIENT_SECRET");
   }
 
-  const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? null : d;
+  const body = new URLSearchParams();
+  body.set("grant_type", "client_credentials");
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+
+  const resp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const ct = resp.headers.get("content-type") || "";
+  const text = await resp.text().catch(() => "");
+  if (!resp.ok) throw new Error(`Token error ${resp.status}: ${text}`);
+
+  if (!ct.includes("application/json")) {
+    throw new Error(`Token endpoint not JSON (ct=${ct}): ${text.slice(0, 200)}`);
+  }
+
+  const j = JSON.parse(text);
+  if (!j?.access_token) throw new Error("Token response missing access_token");
+  return j.access_token;
 }
 
-// --- Pricing mapping helpers (same logic as your front-end used) ---
-async function priceStatusHasMapping(priceStatus) {
-  const ps = String(priceStatus || "").trim();
-  if (!ps) return false;
-  const where = `Price_Status='${escapeWhereValue(ps)}'`;
-  const rows = await listRecordsByWhere("BAR2_PricingV2_Subs", where, 1);
-  return !!rows?.[0]?.Price_Status_Sub;
+async function caspioViewSelect(view, where, selectCsv, limit = 2000, token) {
+  const url =
+    `${CASPIO_BASE}/rest/v2/views/${encodeURIComponent(view)}/records` +
+    `?q.where=${encodeURIComponent(where)}` +
+    `&q.limit=${Number(limit)}` +
+    `&q.select=${encodeURIComponent(selectCsv)}`;
+
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const ct = r.headers.get("content-type") || "";
+  const text = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(`Caspio view error ${r.status}: ${text.slice(0, 250)}`);
+  if (!ct.includes("application/json")) throw new Error(`Caspio view not JSON: ${text.slice(0, 250)}`);
+
+  const j = JSON.parse(text);
+  return Array.isArray(j?.Result) ? j.Result : [];
 }
 
 async function getPriceStatusSub(priceStatus) {
   const ps = String(priceStatus || "").trim();
   if (!ps) return "";
   const where = `Price_Status='${escapeWhereValue(ps)}'`;
-  const rows = await listRecordsByWhere("BAR2_PricingV2_Subs", where, 1);
+  const rows = await listRecordsByWhere(T_SUBS, where, 1);
   return String(rows?.[0]?.Price_Status_Sub || "").trim();
-}
-
-async function loadPricingOptions(priceStatus, capCQ = null) {
-  const pss = await getPriceStatusSub(priceStatus);
-  if (!pss) return [];
-
-  const where = `Price_Status_Sub='${escapeWhereValue(pss)}'`;
-  const rows = await listRecordsByWhere(
-    "BAR2_PricingV2",
-    where,
-    1000
-  );
-
-  // map -> UI options
-  const opts = (rows || [])
-    .map((r) => {
-      const cq = r.C_Quant;
-      const unit = r.Unit;
-      const price = r.Price;
-      const label = String(r.Description || "").trim() || `${cq} / ${unit} / ${price}`;
-      const value = `${cq}|${unit}|${price}`;
-      return { label, value, C_Quant: cq, Unit: unit, Price: price };
-    })
-    .filter((o) => {
-      if (capCQ == null) return true;
-      const n = Number(o.C_Quant);
-      return Number.isFinite(n) ? n <= capCQ : true;
-    });
-
-  // sort by Unit numeric if possible
-  opts.sort((a, b) => {
-    const au = Number(String(a.Unit));
-    const bu = Number(String(b.Unit));
-    if (Number.isFinite(au) && Number.isFinite(bu)) return au - bu;
-    return String(a.label).localeCompare(String(b.label));
-  });
-
-  return opts;
-}
-
-// --- lock rules server-side (mirrors your JS) ---
-function computeLocks({ reservation, billing }) {
-  const locks = {
-    lockMain: false,
-    lockContact: false,
-    lockMessage: "",
-    lockSubMessage: "",
-  };
-
-  const rs = String(reservation?.Status || "").trim().toLowerCase();
-  const billingLockVal = String(billing?.Lock || "").trim().toLowerCase();
-  const chargeType = String(reservation?.Charge_Type || "").trim().toLowerCase();
-
-  const startRaw = billing?.BAR2_Sessions_Date_Start_Time || null;
-  const startDt = parseCaspioDateTime(startRaw);
-
-  let hrsUntil = null;
-  if (startDt && !Number.isNaN(startDt.getTime())) {
-    hrsUntil = (startDt.getTime() - Date.now()) / 36e5;
-  }
-
-  if (rs === "cancelled") {
-    locks.lockMain = true;
-    locks.lockContact = true;
-    locks.lockMessage = "This reservation has been cancelled and may not be edited.";
-    return locks;
-  }
-
-  if (billingLockVal === "locked") {
-    locks.lockMain = true;
-    locks.lockContact = true;
-    locks.lockMessage =
-      "This reservation has been locked and can no longer be edited. Please contact our sales team for support.";
-    return locks;
-  }
-
-  if (chargeType === "pay now") {
-    locks.lockMain = true;
-    locks.lockMessage = "This reservation has been paid for in advance and may not be edited.";
-
-    const allowContact =
-      typeof hrsUntil === "number" && Number.isFinite(hrsUntil) ? hrsUntil > 24 : true;
-
-    locks.lockContact = !allowContact;
-    locks.lockSubMessage = allowContact
-      ? "You may update your contact information until 24 hours prior to the start time."
-      : "Contact information changes are not available within 24 hours of the start time.";
-
-    return locks;
-  }
-
-  const windowHrs = Number(billing?.BAR2_Primary_Config_Cancel_Hour_Window);
-  if (
-    Number.isFinite(windowHrs) &&
-    windowHrs >= 0 &&
-    typeof hrsUntil === "number" &&
-    Number.isFinite(hrsUntil) &&
-    hrsUntil <= windowHrs
-  ) {
-    locks.lockMain = true;
-    locks.lockContact = true;
-    locks.lockMessage = `This reservation is within the ${windowHrs}-hour edit cutoff and is locked.`;
-    return locks;
-  }
-
-  return locks;
 }
 
 export default async function handler(req, res) {
@@ -186,149 +96,72 @@ export default async function handler(req, res) {
 
   try {
     const idkey = String(req.query.idkey || req.query.IDKEY || "").trim();
-    if (!idkey) return res.status(400).json({ ok: false, error: "Missing idkey" });
+    if (!idkey) return res.status(400).json({ ok: false, error: "MISSING_IDKEY" });
 
-    // Optional lightweight mode for pricing refresh (used by UI when time changes)
-    const mode = String(req.query.mode || "").trim().toLowerCase();
-    const sessionIdQ = String(req.query.sessionId || "").trim();
-
-    // Always load reservation (for original CQ + fallback price status)
     const reservation = await getReservationByIdKey(idkey);
-    if (!reservation) return res.status(404).json({ ok: false, error: "Reservation Not Found" });
+    if (!reservation) return res.status(404).json({ ok: false, error: "RESERVATION_NOT_FOUND" });
 
-    const originalCQ = Number(reservation?.C_Quant ?? 0) || 0;
-    const originalPackageKey = `${reservation?.C_Quant}|${reservation?.Units}|${reservation?.Unit_Price}`;
+    const billing = await getResBillingEditViewRowByIdKey(idkey).catch(() => null);
 
-    // Billing view row (for start time, cancel window, lock flag, concept label, People_Text, etc.)
-    const billWhere = `IDKEY='${escapeWhereValue(idkey)}'`;
-    const billingRows = await listViewRecordsByWhere("SIGMA_VW_Res_Billing_Edit", billWhere, 1);
-    const billing = billingRows?.[0] || null;
+    const sessionDate = String(reservation.Session_Date || "").slice(0, 10);
+    const whereSess = `BAR2_Sessions_Date='${escapeWhereValue(sessionDate)}'`;
 
-    const locks = computeLocks({ reservation, billing });
+    // ✅ IMPORTANT: explicitly request the fields the UI uses (includes Calendar_Graphic)
+    const viewSelect = [
+      "BAR2_Sessions_Session_ID",
+      "BAR2_Sessions_Date",
+      "BAR2_Sessions_Business_Unit",
+      "GEN_Business_Units_DBA",
+      "BAR2_Primary_Config_Primary_Name",
+      "BAR2_Primary_Config_Calendar_Graphic",
+      "BAR2_Sessions_Start_Time",
+      "BAR2_Sessions_Price_Status",
+      "BAR2_Sessions_C_Quant",
+      "BAR2_Sessions_Price_Class",
+      "BAR2_Sessions_Title",
+      "BAR2_Sessions_Supplemental_Text",
+      "BAR2_Custom_Session_Info_Content_File",
+      "BAR2_Custom_Session_Info_Title",
+    ].join(",");
 
-    // If pricing mode: just return pricing options for sessionId
-    if (mode === "pricing") {
-      if (!sessionIdQ) return res.status(400).json({ ok: false, error: "Missing sessionId" });
+    const token = await getToken();
+    const sessionsForDateAll = await caspioViewSelect(V_SESS, whereSess, viewSelect, 2000, token);
 
-      const sessWhere = `BAR2_Sessions_Session_ID='${escapeWhereValue(sessionIdQ)}'`;
-      const sessRows = await listViewRecordsByWhere("SIGMA_VW_Active_Sessions_Manage", sessWhere, 1);
-      const sess = sessRows?.[0] || null;
-      if (!sess) return res.status(404).json({ ok: false, error: "Session Not Found" });
-
-      // determine price status (same-session fallback uses reservation C price status if needed)
-      let ps = String(sess?.BAR2_Sessions_Price_Status || "").trim();
-      const fallback = String(billing?.BAR2_Reservations_SIGMA_C_Price_Status || "").trim();
-
-      if (!(await priceStatusHasMapping(ps))) {
-        if (fallback && (await priceStatusHasMapping(fallback))) ps = fallback;
-      }
-
-      if (!(await priceStatusHasMapping(ps))) {
-        return res.status(200).json({ ok: true, pricingOptions: [] });
-      }
-
-      // cap logic: if selecting current session, allow original CQ even if session is "full"
-      const sessCQ = Number(sess?.BAR2_Sessions_C_Quant ?? 0);
-      const cap = sessionIdQ === String(reservation?.Session_ID || "").trim()
-        ? Math.max(originalCQ, Number.isFinite(sessCQ) ? sessCQ : 0)
-        : (Number.isFinite(sessCQ) ? sessCQ : 0);
-
-      const pricingOptions = await loadPricingOptions(ps, cap);
-      return res.status(200).json({ ok: true, pricingOptions });
-    }
-
-    // Full load (sessions + initial pricing)
-    const resDate = dateOnly(reservation?.Session_Date);
-    const resBU = String(reservation?.Business_Unit || "").trim();
-    const sessWhereAll = `BAR2_Sessions_Date='${escapeWhereValue(resDate)}'`;
-    const sessRowsAll = await listViewRecordsByWhere("SIGMA_VW_Active_Sessions_Manage", sessWhereAll, 2000);
-
-    const sessionsForBU = (sessRowsAll || []).filter(
-      (r) => String(r?.BAR2_Sessions_Business_Unit || "").trim() === resBU
+    const resBU = String(reservation.Business_Unit || "").trim();
+    const sessionsAll = (sessionsForDateAll || []).filter(
+      (r) => String(r.BAR2_Sessions_Business_Unit || "").trim() === resBU
     );
 
-    const currentSid = String(reservation?.Session_ID || "").trim();
-
-    const sessions = sessionsForBU.map((r) => {
-      const soldOut = Number(r?.BAR2_Sessions_C_Quant) === 0;
-      const sessionId = String(r?.BAR2_Sessions_Session_ID || "").trim();
-      return {
-        sessionId,
-        type: String(r?.BAR2_Primary_Config_Primary_Name || "").trim(),
-        startTime: String(r?.BAR2_Sessions_Start_Time || "").trim(),
-        priceStatus: String(r?.BAR2_Sessions_Price_Status || "").trim(),
-        soldOut,
-        isCurrent: sessionId && sessionId === currentSid,
-        graphicUrl: String(r?.BAR2_Primary_Config_Calendar_Graphic || "").trim() || "",
-        // extras if you want later:
-        title: String(r?.BAR2_Sessions_Title || "").trim(),
-      };
-    });
-
-    // Determine initial selection from current session
-    const curSess = sessions.find((s) => s.sessionId === currentSid) || null;
-    const selection = {
-      type: curSess?.type || "",
-      startTime: curSess?.startTime || "",
-      sessionId: curSess?.sessionId || "",
-      priceStatus: curSess?.priceStatus || "",
-    };
-
-    // Initial pricing options
-    let initialPS = selection.priceStatus || "";
-    const fallback = String(billing?.BAR2_Reservations_SIGMA_C_Price_Status || "").trim();
-
-    if (!(await priceStatusHasMapping(initialPS))) {
-      if (fallback && (await priceStatusHasMapping(fallback))) initialPS = fallback;
-    }
-
+    // pricing preload (optional)
     let pricingOptions = [];
-    if (await priceStatusHasMapping(initialPS)) {
-      // cap logic for current session
-      const curRowRaw = sessionsForBU.find(
-        (r) => String(r?.BAR2_Sessions_Session_ID || "").trim() === currentSid
-      );
-      const sessCQ = Number(curRowRaw?.BAR2_Sessions_C_Quant ?? 0);
-      const cap = Math.max(originalCQ, Number.isFinite(sessCQ) ? sessCQ : 0);
-      pricingOptions = await loadPricingOptions(initialPS, cap);
-    }
+    try {
+      const curSid = String(reservation.Session_ID || "").trim();
+      const curRow = sessionsAll.find((r) => String(r.BAR2_Sessions_Session_ID || "").trim() === curSid);
+      const sessPS = String(curRow?.BAR2_Sessions_Price_Status || "").trim();
 
-    const conceptLabel = String(billing?.GEN_Business_Units_DBA || "").trim();
+      let pss = await getPriceStatusSub(sessPS);
+      if (!pss && billing) {
+        const fallbackPS = String(billing.BAR2_Reservations_SIGMA_C_Price_Status || "").trim();
+        pss = await getPriceStatusSub(fallbackPS);
+      }
+
+      if (pss) {
+        const wherePricing = `Price_Status_Sub='${escapeWhereValue(pss)}'`;
+        pricingOptions = await listRecordsByWhere(T_PRICING, wherePricing, 1000);
+      }
+    } catch {
+      pricingOptions = [];
+    }
 
     return res.status(200).json({
       ok: true,
-      conceptLabel,
-      locks,
-      reservation: {
-        RES_ID: reservation?.RES_ID,
-        Status: reservation?.Status,
-        Charge_Type: reservation?.Charge_Type,
-        Session_ID: reservation?.Session_ID,
-        Session_Date: reservation?.Session_Date,
-        Business_Unit: reservation?.Business_Unit,
-
-        First_Name: reservation?.First_Name,
-        Last_Name: reservation?.Last_Name,
-        Email: reservation?.Email,
-        Phone_Number: reservation?.Phone_Number,
-        Cust_Notes: reservation?.Cust_Notes,
-
-        originalPackageKey,
-        originalCQ,
-      },
-      billing: {
-        People_Text: billing?.BAR2_Reservations_SIGMA_People_Text || "",
-        Lock: billing?.Lock || "",
-        BAR2_Sessions_Date_Start_Time: billing?.BAR2_Sessions_Date_Start_Time || "",
-        BAR2_Primary_Config_Cancel_Hour_Window: billing?.BAR2_Primary_Config_Cancel_Hour_Window ?? null,
-        BAR2_Reservations_SIGMA_C_Price_Status: billing?.BAR2_Reservations_SIGMA_C_Price_Status || "",
-      },
-      sessions,
-      selection,
+      reservation,
+      billing: billing || null,
+      sessionsAll,
       pricingOptions,
     });
   } catch (e) {
     console.error("manage-load error:", e);
-    return res.status(500).json({ ok: false, error: e?.message || "Server error" });
+    return res.status(500).json({ ok: false, error: e?.message || "SERVER_ERROR" });
   }
 }
